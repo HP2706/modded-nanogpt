@@ -13,26 +13,14 @@ from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+device = "cuda"
+torch.empty(1, device=device, requires_grad=True).backward() # prevents a bug on some systems
+
 import torch.distributed as dist
 from torch import Tensor, nn
-import torch.nn.functional as F
-from torch.nn.attention.flex_attention import BlockMask, flex_attention
-import torch
-from ops import lm_head_fp8
-
-import torch
 from models.Current_best_gpt import GPT
-
-if torch.cuda.is_available():
-    device = "cuda"
-else:
-    device = "cpu"
-    
-from torch import Tensor, nn
-from utils import next_multiple_of_n
-torch.empty(1, device=device, requires_grad=True).backward() # prevents a bug on some systems
-torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
+from utils import next_multiple_of_n, unwrap
+from models.mtp_model import MTPGPT
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -183,16 +171,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
         pos += batch_size
         yield inputs, targets
 
-# -----------------------------------------------------------------------------
-# int main
-# if we use python instead of torchrun, we need to set the rank and world size manually
-if os.environ.get("RANK") is None:
-    os.environ["RANK"] = "0"
-    os.environ["WORLD_SIZE"] = "1"
-    os.environ["LOCAL_RANK"] = "0"
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
-    
+# -----------------------------------------------------------------------------    
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
@@ -203,6 +182,8 @@ torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 
+
+print(f"Rank: {rank}, World size: {world_size}")
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 @dataclass
@@ -221,8 +202,8 @@ class Hyperparameters:
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
     save_checkpoint = False
-    use_liger = False
-    use_adam_mini = False 
+    use_liger = True
+    use_adam_mini = True 
     use_mtp = False
     num_layers = 12
     num_heads = 6
@@ -232,6 +213,8 @@ class Hyperparameters:
     torch_compile = True # for faster iteration speed
     gradient_accumulation_steps = math.ceil(8 / world_size) # emulated batch size  # New parameter for gradient accumulation
     effective_batch_size = batch_size * gradient_accumulation_steps  # Actual batch size after accumulation
+    use_deepseek_mtp = True
+    proj_fp8 = True
 args = Hyperparameters()
 
 
@@ -282,18 +265,17 @@ def print0(_out_dict : Union[dict, str], console=False):
             print(s, file=f)
 
 # begin by printing this file (the Python code)
-print0(code)
-print0("="*100)
+print0(code, console=False)
+print0("="*100, console=False)
 # log information about the hardware/software environment this is running on
-print0(f"Running Python {sys.version}")
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+print0(f"Running Python {sys.version}", console=True)
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}", console=True)
 def nvidia_smi():
     import subprocess  # avoid top level import
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
 
-print0("Loading data", console=True)
 # load data
 train_loader = distributed_data_generator(args.train_files, args.batch_size, rank, world_size)
 
@@ -303,7 +285,18 @@ model = GPT(
     num_layers=args.num_layers, 
     num_heads=args.num_heads,
     model_dim=args.model_dim
-).cuda()
+).cuda() 
+
+""" model = MTPGPT(
+    vocab_size=50257,
+    num_layers=args.num_layers,
+    num_heads=args.num_heads,
+    model_dim=args.model_dim,
+    n_mtp_tokens=args.n_mtp_tokens,
+    use_liger=args.use_liger,
+    use_deepseek_mtp=args.use_deepseek_mtp,
+    proj_fp8=args.proj_fp8
+).cuda() """
 
 from utils import numel_params_million
 print0(f"Model created with {numel_params_million(model)}M parameters", console=True)
@@ -313,12 +306,21 @@ for m in model.modules():
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-# collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params = [model.lm_head.weight]
+
+
+
 if not args.use_adam_mini:
+    # collect the parameters to optimize
+    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+
+    if isinstance(unwrap(model), MTPGPT):
+        head_params = [model.mtp.shared_head.weight]
+        from itertools import chain
+        hidden_matrix_params.extend([p for n, p in chain(model.mtp.blocks.named_parameters(), model.mtp.projs.named_parameters()) if p.ndim >= 2 and "embed" not in n])
+    else:
+        head_params = [model.lm_head.weight]
 
     # init the optimizer(s)
     adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
@@ -329,15 +331,17 @@ if not args.use_adam_mini:
     optimizers = [optimizer1, optimizer2]
 else:
     from adam_mini import Adam_mini
-    embed_params = [(n,p) for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [(n,p) for n, p in model.named_parameters() if p.ndim < 2]
-    head_params = [('lm_head.weight', model.lm_head.weight)]
+    
     optimizers = [Adam_mini(
-        dict(embed_params, lr=0.008),
-        dict(scalar_params, lr=0.04),
-        dict(head_params, lr=0.008),
-        weight_decay=0.01
-    )]
+        model.named_parameters(), 
+        lr=0.008, 
+        model_sharding=False, 
+        dim=args.model_dim, 
+        n_heads=args.num_heads
+        )
+    ]
+            
+       
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
@@ -366,6 +370,8 @@ t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
 print0(f"Starting training loop for {train_steps} steps", console=True)
+total_tokens_seen = 0  # Track lifetime total tokens
+tokens_seen = 0  # Track tokens for throughput calculation
 for step in range(train_steps + 1):
     print0(f"Beginning step {step}", console=True)
     last_step = (step == train_steps)
@@ -373,6 +379,7 @@ for step in range(train_steps + 1):
     if step == 10:
         print0("Resetting timing measurements", console=True)
         training_time_ms = 0
+        tokens_seen = 0  # Reset tokens count for throughput calculation only
         t0 = time.perf_counter()
     timed_steps = float("nan") if step <= 11 else (step - 10) + 1
 
@@ -397,8 +404,9 @@ for step in range(train_steps + 1):
         print0("Validation complete, reducing loss", console=True)
         val_loss /= val_steps
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0({"step": step, "val_loss": val_loss, "train_time": training_time_ms}, console=True)
-        
+        print0({"step": step, "val_loss": val_loss, "train_time": training_time_ms, "train_time_minutes": training_time_ms / 60*1000}, console=True)
+        if args.use_wandb:
+            wandb.log({"step": step, "val_loss": val_loss, "train_time": training_time_ms})
         model.train()
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -410,13 +418,14 @@ for step in range(train_steps + 1):
     # Training section
     print0(f"Loading training batch for step {step}", console=True)
     inputs, targets = next(train_loader)
+    batch_tokens = inputs.numel() * world_size
+    tokens_seen += batch_tokens  # For throughput calculation
+    total_tokens_seen += batch_tokens  # Lifetime total
     
     # Scale loss by gradient accumulation steps
     loss_scale = 1.0 / args.gradient_accumulation_steps
     
     for i, (input_seq, target_seq) in enumerate(zip(inputs.split(args.seq_len), targets.split(args.seq_len))):
-        print0(f"Processing sequence {i+1}/{len(inputs.split(args.seq_len))}", console=True)
-        print0(f"Sequence shapes - input: {input_seq.shape}, target: {target_seq.shape}", console=True)
         out = model.forward(input_seq, target_seq, sw_num_blks(window_size))
         if isinstance(out, tuple):
             loss, shared_trunk_grad = out
@@ -438,8 +447,10 @@ for step in range(train_steps + 1):
             
         print0("Updating optimizers", console=True)
         frac = min(step / 300, 1)
-        for group in optimizer2.param_groups:
-            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        if not args.use_adam_mini:
+            for group in optimizer2.param_groups:
+                group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+                
         for opt, sched in zip(optimizers, schedulers):
             opt.step()
             sched.step()
@@ -449,6 +460,14 @@ for step in range(train_steps + 1):
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"Completed step {step} in {approx_time:.2f} ms", console=True)
     print0(f"Loss: {loss.item()}", console=True)
+
+    tokens_per_sec = batch_tokens / (approx_time / 1000)
+    print0({
+        "step": step,
+        "loss": loss.item(),
+        "tokens_seen": total_tokens_seen,  # Log total lifetime tokens
+        "tokens_per_sec": tokens_per_sec
+    }, console=True)
 
 
 print0(

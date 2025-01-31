@@ -92,7 +92,6 @@ class GPT(nn.Module):
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
-            print(x.shape)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         block_masks.reverse()

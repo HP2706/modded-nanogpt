@@ -7,3 +7,4 @@ wandb
 transformers
 adam-mini
 transformers
+tqdm

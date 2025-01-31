@@ -129,7 +129,7 @@ class MTP(nn.Module):
             self.loss_fn = torch.nn.CrossEntropyLoss()
         
 
-    def forward(self, hidden_states : torch.Tensor, labels : torch.LongTensor):
+    def forward(self, hidden_states: Tensor, next_token_embs: Tensor, x0: Tensor, block_mask, labels: Tensor):
         '''
         hidden_states : (B, T, H)
         labels : (B, T+N_tokens)
@@ -182,9 +182,11 @@ class MTPGPT(nn.Module):
         n_mtp_tokens: int, 
         use_deepseek_mtp: bool = True,
         use_liger: bool = True,
-        proj_fp8: bool = True
+        proj_fp8: bool = True,
+        device: torch.device = torch.device("cuda")
     ):
         super().__init__()
+        self.device = device
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         self.value_embeds = ValueEmbedding(vocab_size, model_dim)
@@ -200,6 +202,7 @@ class MTPGPT(nn.Module):
         if use_deepseek_mtp:
             self.mtp = DeepSeekV3MTP(
                 n_tokens=n_mtp_tokens,
+                num_heads=num_heads,
                 d_hidden=model_dim,
                 d_vocab=next_multiple_of_n(vocab_size, n=128),
                 use_liger=use_liger,
@@ -231,7 +234,7 @@ class MTPGPT(nn.Module):
         # manual block mask creation by @YouJiacheng
         assert len(input_seq) % BLOCK_SIZE == 0
         NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
-        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device=device)
+        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device=self.device)
         any_causal_bm = block_idx[:, None] >= block_idx
         all_causal_bm = block_idx[:, None] > block_idx
         docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
@@ -264,7 +267,10 @@ class MTPGPT(nn.Module):
 
         long_bm, short_bm = self.create_block_masks(input_seq, sliding_window_num_blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = x0 = norm(self.embed(input_seq)[None])
+        # Get embeddings for the target sequence tokens
+        next_token_embs = norm(self.embed(target_seq[:, :self.mtp.n_tokens]))
+        
         ve = self.value_embeds(input_seq)
         assert len(ve) == len(self.blocks)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
@@ -284,9 +290,13 @@ class MTPGPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
         x = norm(x)
         
-        # we backpropagate the loss by doing x.backward(gradient=shared_trunk_grad)
-        # instead of loss.backward()
-        # we keep the loss for logging
-        loss, shared_trunk_grad = self.mtp.forward(x, target_seq)
+        # Update the mtp.forward() call with embedded tokens
+        loss, shared_trunk_grad = self.mtp.forward(
+            hidden_states=x,
+            next_token_embs=next_token_embs,  # Now passing embedded tokens
+            x0=x0,
+            block_mask=long_bm,
+            labels=target_seq
+        )
         return loss, x, shared_trunk_grad 
             
