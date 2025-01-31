@@ -1,4 +1,6 @@
+from tqdm import tqdm
 import os
+import math
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
@@ -8,9 +10,17 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-import torch.distributed as dist
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import torch
+torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+import torch.distributed as dist
+from torch import Tensor, nn
+import torch.nn.functional as F
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+import torch
+from ops import lm_head_fp8
+
 import torch
 from models.Current_best_gpt import GPT
 
@@ -203,7 +213,7 @@ class Hyperparameters:
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
 
-    seq_len = 32*1024 # FlexAttention sequence length
+    seq_len = 64*1024 # FlexAttention sequence length
     batch_size = world_size*seq_len   #TODO back to: 64*1024 # batch size in tokens
     num_iterations = 1393 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
@@ -220,11 +230,10 @@ class Hyperparameters:
     n_mtp_tokens : Optional[int] = 12
     use_wandb = True
     torch_compile = True # for faster iteration speed
-    gradient_accumulation_steps = 8*2 # emulated batch size  # New parameter for gradient accumulation
+    gradient_accumulation_steps = math.ceil(8 / world_size) # emulated batch size  # New parameter for gradient accumulation
     effective_batch_size = batch_size * gradient_accumulation_steps  # Actual batch size after accumulation
 args = Hyperparameters()
 
-print("args", args)
 
 assert args.effective_batch_size == 1024*64*8, f"effective_batch_size is not {1024*64*8} got: {args.effective_batch_size}"
 
@@ -381,7 +390,6 @@ for step in range(train_steps + 1):
         val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
         val_loss = 0
         with torch.no_grad():
-            from tqdm import tqdm
             for val_step in tqdm(range(val_steps), desc="Validation steps", leave=False, disable=not master_process):
                 x, y = next(val_loader)
                 val_loss += model.forward(x, y, sw_num_blks(window_size))
@@ -410,7 +418,6 @@ for step in range(train_steps + 1):
         print0(f"Processing sequence {i+1}/{len(inputs.split(args.seq_len))}", console=True)
         print0(f"Sequence shapes - input: {input_seq.shape}, target: {target_seq.shape}", console=True)
         out = model.forward(input_seq, target_seq, sw_num_blks(window_size))
-        print0(f"Forward pass completed for sequence {i+1}", console=True)
         if isinstance(out, tuple):
             loss, shared_trunk_grad = out
             print0(f"Starting backward pass for sequence {i+1}", console=True)
@@ -419,6 +426,8 @@ for step in range(train_steps + 1):
         else:
             loss = out
             (loss_scale * loss).backward()
+
+        wandb.log({"loss": loss.item()})
             
     # Only perform optimizer step after accumulating gradients
     if (step + 1) % args.gradient_accumulation_steps == 0:
@@ -438,7 +447,9 @@ for step in range(train_steps + 1):
         model.zero_grad(set_to_none=True)
 
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"Completed step {step}", console=True)
+    print0(f"Completed step {step} in {approx_time:.2f} ms", console=True)
+    print0(f"Loss: {loss.item()}", console=True)
+
 
 print0(
     f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
