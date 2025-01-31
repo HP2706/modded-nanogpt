@@ -10,7 +10,13 @@ from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+
+if torch.cuda.is_available():
+    device = "cuda"
+else:
+    device = "cpu"
+    
+torch.empty(1, device=device, requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -168,7 +174,7 @@ class Muon(torch.optim.Optimizer):
         assert all(isinstance(p, Tensor) for p in params)
         sizes = {p.numel() for p in params}
         def create_update_buffer(size: int):
-            b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device="cuda")
+            b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device=device)
             return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(self.world_size)])
         param_groups = [
             dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size)) for size in sizes]
@@ -331,11 +337,86 @@ class ValueEmbedding(nn.Module):
 # -----------------------------------------------------------------------------
 # The main model
 
+from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
+
+class MTP(torch.nn.Module):
+    def __init__(
+        self, 
+        n_tokens : int,
+        d_hidden : int,
+        d_vocab : int,
+        use_liger : bool = True,
+    ):
+        super().__init__()
+        self.n_tokens = n_tokens
+        self.d_hidden = d_hidden
+        self.d_vocab = d_vocab
+        self.heads = torch.nn.ModuleList([
+            torch.nn.Linear(d_hidden, d_vocab) for _ in range(n_tokens)
+        ])
+        self.use_liger = use_liger
+        if use_liger:
+            self.loss_fn = LigerFusedLinearCrossEntropyLoss()
+        else:
+            self.loss_fn = torch.nn.CrossEntropyLoss()
+        
+
+    def forward(self, hidden_states : torch.Tensor, labels : torch.LongTensor):
+        '''
+        hidden_states : (B, T, H)
+        labels : (B, T+N_tokens)
+        
+        
+        this function computes the gradient of the loss 
+        '''
+        assert hidden_states.shape[1] == labels.shape[1] - self.n_tokens
+        
+        shared_trunk = hidden_states.detach()
+        shared_trunk.requires_grad = True
+        
+        loss_accum = 0
+        for i in range(self.n_tokens):
+            # remove the first i tokens
+            shift_labels = labels[..., (1 + i) :].contiguous().view(-1) 
+            head : torch.nn.Linear = self.heads[i]
+            #TODO can this be done in fp8?
+            #TODO 30 * torch.sigmoid(logits.float() / 7.5) tanh softcapping??
+            if self.use_liger:
+                loss = self.loss_fn.forward(
+                    head.weight,
+                    shared_trunk, # merge batch and sequence dimensions
+                    shift_labels,
+                    bias=head.bias,
+                )
+                
+            else:
+                #TODO use fp8 matmul??
+                logits = head.forward(shared_trunk)
+                loss =self.loss_fn.forward(logits.view(-1, self.d_vocab), shift_labels)
+            
+            #NOTE we call backward multiple times to accumulate the gradients to d(the shared trunk)
+            loss.backward()
+            loss_accum += loss.detach() # We only need this for logging
+            
+            
+        #hidden_states.backward(gradient=shared_trunk.grad)
+        return loss_accum, shared_trunk.grad
+        
+
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int):
+    def __init__(
+        self, 
+        vocab_size: int, 
+        num_layers: int, 
+        num_heads: int, 
+        model_dim: int, 
+        n_mtp_tokens: int, 
+        use_liger: bool = True,
+        use_mtp: bool = True
+    ):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
@@ -348,9 +429,19 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128))
-        self.lm_head.weight.detach().zero_() # @Grad62304977
-
+        
+        self.use_mtp = use_mtp
+        if use_mtp:
+            self.mtp = MTP(
+                n_tokens=n_mtp_tokens,
+                d_hidden=model_dim,
+                d_vocab=next_multiple_of_n(vocab_size, n=128),
+                use_liger=use_liger,
+            )
+        else:
+            self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128))
+            self.lm_head.weight.detach().zero_() # @Grad62304977
+            
     def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
         docs = (input_seq == 50256).cumsum(0)
@@ -368,7 +459,7 @@ class GPT(nn.Module):
         # manual block mask creation by @YouJiacheng
         assert len(input_seq) % BLOCK_SIZE == 0
         NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
-        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
+        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device=device)
         any_causal_bm = block_idx[:, None] >= block_idx
         all_causal_bm = block_idx[:, None] > block_idx
         docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
@@ -391,7 +482,12 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+    def forward(
+        self, 
+        input_seq: Tensor, 
+        target_seq: Tensor, 
+        sliding_window_num_blocks: Tensor
+    )-> Tensor | tuple[Tensor, Tensor]:
         assert input_seq.ndim == 1
 
         long_bm, short_bm = self.create_block_masks(input_seq, sliding_window_num_blocks)
@@ -415,11 +511,20 @@ class GPT(nn.Module):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
         x = norm(x)
-        logits = lm_head_fp8(x, self.lm_head.weight) if self.training else self.lm_head(x)
-        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
-        logits = 30 * torch.sigmoid(logits.float() / 7.5)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
-        return loss
+        
+        if not self.use_mtp:
+            logits = lm_head_fp8(x, self.lm_head.weight) if self.training else self.lm_head(x)
+            # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+            logits = 30 * torch.sigmoid(logits.float() / 7.5)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
+            return loss
+        else:
+            # we backpropagate the loss by doing x.backward(gradient=shared_trunk_grad)
+            # instead of loss.backward()
+            # we keep the loss for logging
+            loss, shared_trunk_grad = self.mtp.forward(x, target_seq)
+            return loss, x, shared_trunk_grad 
+            
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -446,8 +551,8 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
         if pos + batch_size + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
         buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
+        inputs = buf[:-1].to(device=device, dtype=torch.int32, non_blocking=True) # no sync on host side;
+        targets = buf[1:].to(device=device, dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
         pos += batch_size
         yield inputs, targets
 
@@ -469,13 +574,15 @@ class Hyperparameters:
     # implementation
     seq_len = 64*1024 # FlexAttention sequence length
     save_checkpoint = False
+    use_liger = True
+    use_adam_mini = True
 args = Hyperparameters()
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert torch.cuda.is_available()
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+device = torch.device(device, int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
@@ -517,19 +624,25 @@ for m in model.modules():
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
+
+
 # collect the parameters to optimize
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
+if not args.use_adam_mini:
 
-# init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
-# discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
-optimizers = [optimizer1, optimizer2]
+    # init the optimizer(s)
+    adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+    # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+    # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+    optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+    optimizers = [optimizer1, optimizer2]
+else:
+    from adam_mini import Adam_mini
+    optimizers = [Adam_mini(model.parameters(), lr=0.008, weight_decay=0.01)]
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
@@ -542,7 +655,7 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 def sw_num_blks(window_size: int):
     return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
-model: nn.Module = torch.compile(model)
+model: GPT = torch.compile(model)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -596,9 +709,15 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+
     inputs, targets = next(train_loader)
     for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
-        model(input_seq, target_seq, sw_num_blks(window_size)).backward()
+        out = model.forward(input_seq, target_seq, sw_num_blks(window_size))
+        if isinstance(out, tuple):
+            loss, shared_trunk_grad = out
+            shared_trunk_grad.backward()
+        else:
+            loss = out
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     # momentum warmup for Muon
