@@ -5,3 +5,5 @@ huggingface-hub
 liger-kernel
 wandb
 transformers
+adam-mini
+transformers

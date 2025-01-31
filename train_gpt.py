@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import torch.distributed as dist
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -188,6 +189,7 @@ world_size = int(os.environ["WORLD_SIZE"])
 assert torch.cuda.is_available()
 device = torch.device(device, int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
+
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 
@@ -201,7 +203,7 @@ class Hyperparameters:
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
 
-    seq_len = 64*1024 # FlexAttention sequence length
+    seq_len = 32*1024 # FlexAttention sequence length
     batch_size = world_size*seq_len   #TODO back to: 64*1024 # batch size in tokens
     num_iterations = 1393 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
@@ -217,10 +219,14 @@ class Hyperparameters:
     model_dim = 768
     n_mtp_tokens : Optional[int] = 12
     use_wandb = True
-    torch_compile = False # for faster iteration speed
+    torch_compile = True # for faster iteration speed
+    gradient_accumulation_steps = 8*2 # emulated batch size  # New parameter for gradient accumulation
+    effective_batch_size = batch_size * gradient_accumulation_steps  # Actual batch size after accumulation
 args = Hyperparameters()
 
 print("args", args)
+
+assert args.effective_batch_size == 1024*64*8, f"effective_batch_size is not {1024*64*8} got: {args.effective_batch_size}"
 
 def gen_name(args: Hyperparameters, uuid: uuid.UUID):
     return (
@@ -287,13 +293,11 @@ model = GPT(
     vocab_size=50257, 
     num_layers=args.num_layers, 
     num_heads=args.num_heads,
-    model_dim=args.model_dim, 
-    n_mtp_tokens=args.n_mtp_tokens, 
-    use_liger=args.use_liger, 
-    use_mtp=args.use_mtp
+    model_dim=args.model_dim
 ).cuda()
 
-print0("Model created", console=True)
+from utils import numel_params_million
+print0(f"Model created with {numel_params_million(model)}M parameters", console=True)
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -398,8 +402,9 @@ for step in range(train_steps + 1):
     # Training section
     print0(f"Loading training batch for step {step}", console=True)
     inputs, targets = next(train_loader)
-    print0(f"Processing {len(inputs.split(args.seq_len))} sequences", console=True)
-    print0(f"Input shape: {inputs.shape}, Target shape: {targets.shape}", console=True)
+    
+    # Scale loss by gradient accumulation steps
+    loss_scale = 1.0 / args.gradient_accumulation_steps
     
     for i, (input_seq, target_seq) in enumerate(zip(inputs.split(args.seq_len), targets.split(args.seq_len))):
         print0(f"Processing sequence {i+1}/{len(inputs.split(args.seq_len))}", console=True)
@@ -409,25 +414,29 @@ for step in range(train_steps + 1):
         if isinstance(out, tuple):
             loss, shared_trunk_grad = out
             print0(f"Starting backward pass for sequence {i+1}", console=True)
-            shared_trunk_grad.backward()
+            (loss_scale * shared_trunk_grad).backward()
             print0(f"Completed backward pass for sequence {i+1}", console=True)
         else:
             loss = out
+            (loss_scale * loss).backward()
             
-    print0("Reducing gradients", console=True)
-    for param in model.parameters():
-        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        
-    print0("Updating optimizers", console=True)
-    frac = min(step / 300, 1)
-    for group in optimizer2.param_groups:
-        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    for opt, sched in zip(optimizers, schedulers):
-        opt.step()
-        sched.step()
-        
-    model.zero_grad(set_to_none=True)
-    
+    # Only perform optimizer step after accumulating gradients
+    if (step + 1) % args.gradient_accumulation_steps == 0:
+        print0("Reducing gradients", console=True)
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+            
+        print0("Updating optimizers", console=True)
+        frac = min(step / 300, 1)
+        for group in optimizer2.param_groups:
+            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        for opt, sched in zip(optimizers, schedulers):
+            opt.step()
+            sched.step()
+            
+        model.zero_grad(set_to_none=True)
+
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"Completed step {step}", console=True)
 

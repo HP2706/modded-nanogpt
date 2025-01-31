@@ -1,4 +1,5 @@
-
+from torch import Tensor
+import torch
 
 # -----------------------------------------------------------------------------
 # Custom operators : FP8 matmul for lm_head by @YouJiacheng
