@@ -8,3 +8,4 @@ transformers
 adam-mini
 transformers
 tqdm
+hf-transfer

@@ -4,10 +4,12 @@ import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-from ops import lm_head_fp8
+if torch.cuda.is_available():
+    from ops import lm_head_fp8
+else:
+    lm_head_fp8 = None
 from utils import next_multiple_of_n
-from models.shared import ValueEmbedding, Block, CausalSelfAttention, MLP, CastedLinear, norm
-from models.Current_best_gpt import GPT
+from models.shared import ValueEmbedding, Block, CastedLinear, norm
 from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 
 
@@ -51,23 +53,98 @@ class DeepSeekV3MTP(nn.Module):
         else:
             self.loss_fn = torch.nn.CrossEntropyLoss()
 
-    def forward(self, hidden_states: Tensor, next_token_embs: Tensor, x0: Tensor, block_mask, labels: Tensor):
+    def forward1(
+        self, 
+        shared_trunk: Tensor, 
+        x0: Tensor, 
+        block_mask: BlockMask, 
+        labels: Tensor
+    ):
         """
-        hidden_states: (B, T, H)
+        shared_trunk: (B, T, H)
         next_token_embs: (B, N, H) where N is n_tokens
-        labels: (B, T+N)
         x0: (B, T, H)
+        block_mask: (B, T)
+        labels: (B, T+N)
         """
-        assert hidden_states.shape[1] == labels.shape[1] - self.n_tokens
+        assert shared_trunk.shape[1] == labels.shape[1] - self.n_tokens
+
+        
+        current_hidden = shared_trunk
+        T = shared_trunk.shape[1]
+        
+        loss_accum = 0
+        for i in range(self.n_tokens):
+            # Create a fresh computation graph for each iteration
+            current_hidden = current_hidden.detach()
+            current_hidden.requires_grad = True
+            current_hidden.retain_grad()
+            
+            # Normalize inputs
+            embs = x0[:, i:i+T, :]
+            
+            x_norm = norm(current_hidden)
+            next_norm = norm(embs)
+            
+            # Combine and project
+            combined = torch.cat([x_norm, next_norm], dim=-1)
+            h_prime = self.projs[i].forward(combined)
+            
+            # Pass through transformer block
+            block : Block = self.blocks[i]
+            current_hidden = block.forward(h_prime, None, embs, block_mask)
+            
+            # Get predictions and compute loss
+            shift_labels = labels[..., i:i+T].contiguous().view(-1)
+            head = self.shared_head
+            
+            if self.use_liger:
+                loss = self.loss_fn.forward(
+                    head.weight,
+                    current_hidden,
+                    shift_labels,
+                    bias=head.bias,
+                )
+            else:
+                if self.proj_fp8:
+                    logits = lm_head_fp8(current_hidden, head.weight)
+                else:
+                    logits = head.forward(current_hidden)
+                loss = self.loss_fn.forward(logits.view(-1, self.d_vocab), shift_labels)
+            
+            # Compute gradients for this iteration
+            loss.backward(retain_graph=True)
+            loss_accum += loss.detach()
+            
+            # Accumulate gradients for shared_trunk using autograd.grad with allow_unused=True
+            grads = torch.autograd.grad(loss, shared_trunk, retain_graph=True, allow_unused=True)[0]
+            if grads is not None:  # Only accumulate if we got gradients
+                if shared_trunk.grad is None:
+                    shared_trunk.grad = grads
+                else:
+                    shared_trunk.grad += grads
+            
+        return loss_accum, shared_trunk.grad
+    
+    def forward2(self, shared_trunk: Tensor, next_token_embs: Tensor, x0: Tensor, block_mask, labels: Tensor):
+        """
+        shared_trunk: (B, T, H)
+        next_token_embs: (B, N, H) where N is n_tokens
+        x0: (B, T, H)
+        block_mask: (B, T)
+        labels: (B, T+N)
+        """
+        assert shared_trunk.shape[1] == labels.shape[1] - self.n_tokens
         assert next_token_embs.shape[1] == self.n_tokens
         
-        shared_trunk = hidden_states.detach()
-        shared_trunk.requires_grad = True
+        shared_trunk = shared_trunk
+        
+        current_hidden = shared_trunk
         
         loss_accum = 0
         for i in range(self.n_tokens):
             # Normalize inputs
-            x_norm = norm(shared_trunk)
+            x_norm = norm(current_hidden) # this corresponds 
             next_norm = norm(next_token_embs[:, i])
             
             # Combine and project
@@ -75,7 +152,8 @@ class DeepSeekV3MTP(nn.Module):
             h_prime = self.projs[i].forward(combined)
             
             # Pass through transformer block
-            block_output = self.blocks[i].forward(h_prime, None, x0, block_mask)
+            block : Block = self.blocks[i]
+            current_hidden = block.forward(h_prime, None, x0, block_mask)
             
             # Get predictions and compute loss
             shift_labels = labels[..., (1 + i):].contiguous().view(-1)
@@ -84,21 +162,19 @@ class DeepSeekV3MTP(nn.Module):
             if self.use_liger:
                 loss = self.loss_fn.forward(
                     head.weight,
-                    block_output,
+                    current_hidden,
                     shift_labels,
                     bias=head.bias,
                 )
             else:
                 if self.proj_fp8:
-                    logits = lm_head_fp8(block_output, head.weight)
+                    logits = lm_head_fp8(current_hidden, head.weight)
                 else:
-                    logits = head.forward(block_output)
+                    logits = head.forward(current_hidden)
                 loss = self.loss_fn.forward(logits.view(-1, self.d_vocab), shift_labels)
+            loss_accum += loss
             
-            loss.backward()
-            loss_accum += loss.detach()
-            
-        return loss_accum, shared_trunk.grad
+        return loss_accum, None
 
 
 class MTP(nn.Module):
@@ -129,17 +205,23 @@ class MTP(nn.Module):
             self.loss_fn = torch.nn.CrossEntropyLoss()
         
 
-    def forward(self, hidden_states: Tensor, next_token_embs: Tensor, x0: Tensor, block_mask, labels: Tensor):
+    def forward(
+        self, 
+        shared_trunk: Tensor, 
+        x0: Tensor, 
+        block_mask: Tensor, 
+        labels: Tensor
+    ):
         '''
-        hidden_states : (B, T, H)
+        shared_trunk : (B, T, H)
         labels : (B, T+N_tokens)
         
         
         this function computes the gradient of the loss 
         '''
-        assert hidden_states.shape[1] == labels.shape[1] - self.n_tokens
+        assert shared_trunk.shape[1] == labels.shape[1] - self.n_tokens
         
-        shared_trunk = hidden_states.detach()
+        shared_trunk = shared_trunk.detach()
         shared_trunk.requires_grad = True
         
         loss_accum = 0
@@ -265,13 +347,21 @@ class MTPGPT(nn.Module):
     )-> Tensor | tuple[Tensor, Tensor]:
         assert input_seq.ndim == 1
 
-        long_bm, short_bm = self.create_block_masks(input_seq, sliding_window_num_blocks)
+        # we process the input sequence without the last mtp.n_tokens
+        # as usual.
+        k_excl_input_seq = input_seq[:, :-self.mtp.n_tokens] # exclude the last mtp.n_tokens
+        long_bm, short_bm = self.create_block_masks(k_excl_input_seq, sliding_window_num_blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None])
+        x = x0 = norm(self.embed(input_seq)[None]) 
+        # we need the embeddings for the last mtp.n_tokens also
         # Get embeddings for the target sequence tokens
-        next_token_embs = norm(self.embed(target_seq[:, :self.mtp.n_tokens]))
         
-        ve = self.value_embeds(input_seq)
+        # NOTE does this allocate new memory?
+        x0_for_processing = x0[..., :-self.mtp.n_tokens]
+        assert x0_for_processing.storage().data_ptr() == x0.storage().data_ptr(), "new memory allocated!!"
+        
+        
+        ve = self.value_embeds(k_excl_input_seq)
         assert len(ve) == len(self.blocks)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
         assert len(ve_enc) == self.num_encoder_layers and len(ve_dec) == self.num_decoder_layers
@@ -281,22 +371,24 @@ class MTPGPT(nn.Module):
         # Encoder pass - process only the first half of the blocks
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
+            x = self.blocks[i](x, ve_enc[i], x0_for_processing, block_masks[i])
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         block_masks.reverse()
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
+            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0_for_processing, block_masks[i])
         x = norm(x)
         
         # Update the mtp.forward() call with embedded tokens
+        d = x.detach()
+        d.requires_grad = True
         loss, shared_trunk_grad = self.mtp.forward(
-            hidden_states=x,
-            next_token_embs=next_token_embs,  # Now passing embedded tokens
+            shared_trunk=d,
             x0=x0,
             block_mask=long_bm,
             labels=target_seq
         )
-        return loss, x, shared_trunk_grad 
+        d.backward(gradient=shared_trunk_grad)
+        return loss, x, d.grad 
             
