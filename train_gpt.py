@@ -1,4 +1,5 @@
 from tqdm import tqdm
+from itertools import chain
 import os
 import math
 import sys
@@ -20,7 +21,7 @@ import torch.distributed as dist
 from torch import Tensor, nn
 from models.Current_best_gpt import GPT
 from utils import next_multiple_of_n, unwrap
-from models.mtp_model import MTPGPT
+from models.mtp_model import MTPGPT, MTP, DeepSeekV3MTP
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -150,10 +151,21 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
+def distributed_data_generator(
+    filename_pattern: str, 
+    batch_size: int, 
+    rank : int, 
+    world_size : int,
+    from_path : Optional[str] = None
+):
     print0(f"Starting data generator with batch_size={batch_size}, rank={rank}, world_size={world_size}")
-    files = sorted(Path.cwd().glob(filename_pattern))
-    print0(f"Found {len(files)} files matching pattern: {filename_pattern}")
+    if from_path:
+        base_path = Path(from_path)
+        files = sorted(base_path.glob(filename_pattern))
+    else:
+        files = sorted(Path.cwd().glob(filename_pattern))
+        
+    print0(f"Found {len(files)} files matching pattern: {filename_pattern}", console=True)
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
     file_iter = iter(files)
@@ -191,7 +203,10 @@ print(f"Rank: {rank}, World size: {world_size}")
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 
-seq_len = 1024 if not is_a10g else 1024*64
+
+
+n_tokens = 2    
+seq_len = 64*(1024+n_tokens) if not is_a10g else 1024 + n_tokens
 
 @dataclass
 class Hyperparameters:
@@ -208,7 +223,7 @@ class Hyperparameters:
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
     save_checkpoint = False
-    use_liger = True
+    use_liger = False
     use_adam_mini = False 
     use_mtp = False
     num_layers = 12
@@ -220,8 +235,8 @@ class Hyperparameters:
     torch_compile = True if not is_a10g else False # for faster iteration speed
     gradient_accumulation_steps = math.ceil(8 / world_size) # emulated batch size  # New parameter for gradient accumulation
     effective_batch_size = batch_size * gradient_accumulation_steps  # Actual batch size after accumulation
-    use_deepseek_mtp = True
-    proj_fp8 = True
+    use_deepseek_mtp = False
+    proj_fp8 = False
 args = Hyperparameters()
 
 
@@ -284,18 +299,27 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
+IS_MODAL = True
+
 # load data
-train_loader = distributed_data_generator(args.train_files, args.batch_size, rank, world_size)
+train_loader = distributed_data_generator(
+    args.train_files, 
+    args.batch_size,
+    rank, 
+    world_size,
+    from_path='/root/data' if IS_MODAL else None
+)
 
 print0("Creating model", console=True)
-model = GPT(
+""" model = GPT(
     vocab_size=50257, 
     num_layers=args.num_layers, 
     num_heads=args.num_heads,
-    model_dim=args.model_dim
-).cuda() 
+    model_dim=args.model_dim,
+    use_fp8=args.proj_fp8
+).cuda()  """
 
-""" model = MTPGPT(
+model = MTPGPT(
     vocab_size=50257,
     num_layers=args.num_layers,
     num_heads=args.num_heads,
@@ -304,7 +328,7 @@ model = GPT(
     use_liger=args.use_liger,
     use_deepseek_mtp=args.use_deepseek_mtp,
     proj_fp8=args.proj_fp8
-).cuda() """
+).cuda()
 
 from utils import numel_params_million
 print0(f"Model created with {numel_params_million(model)}M parameters", console=True)
@@ -324,9 +348,11 @@ if not args.use_adam_mini:
     scalar_params = [p for p in model.parameters() if p.ndim < 2]
 
     if isinstance(unwrap(model), MTPGPT):
-        head_params = [model.mtp.shared_head.weight]
-        from itertools import chain
-        hidden_matrix_params.extend([p for n, p in chain(model.mtp.blocks.named_parameters(), model.mtp.projs.named_parameters()) if p.ndim >= 2 and "embed" not in n])
+        if isinstance(model.mtp, MTP):
+            head_params = [head.weight for head in model.mtp.heads]
+        else:
+            head_params = [model.mtp.shared_head.weight]
+            hidden_matrix_params.extend([p for n, p in chain(model.mtp.blocks.named_parameters(), model.mtp.projs.named_parameters()) if p.ndim >= 2 and "embed" not in n])
     else:
         head_params = [model.lm_head.weight]
 
@@ -402,7 +428,13 @@ for step in range(train_steps + 1):
         model.eval()
         val_batch_size = world_size * args.seq_len
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+        val_loader = distributed_data_generator(
+            args.val_files, 
+            val_batch_size, 
+            rank, 
+            world_size,
+            from_path='/root/data' if IS_MODAL else None
+        )
         val_loss = 0
         with torch.no_grad():
             for val_step in tqdm(range(val_steps), desc="Validation steps", leave=False, disable=not master_process):
@@ -433,6 +465,7 @@ for step in range(train_steps + 1):
     # Scale loss by gradient accumulation steps
     loss_scale = 1.0 / args.gradient_accumulation_steps
     
+        
     for i, (input_seq, target_seq) in enumerate(zip(inputs.split(args.seq_len), targets.split(args.seq_len))):
         out = model.forward(input_seq, target_seq, sw_num_blks(window_size))
         if isinstance(out, tuple):

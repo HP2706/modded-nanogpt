@@ -182,18 +182,18 @@ class DeepSeekV3MTP(nn.Module):
 class MTP(nn.Module):
     def __init__(
         self, 
-        hidden_dim: int, 
-        num_heads: int, 
-        num_classes_per_head: int,
+        d_hidden: int, 
+        n_tokens: int, 
+        d_vocab: int,
         use_liger: bool = False,
         proj_fp8: bool = False
     ):
         super().__init__()
-        self.num_heads = num_heads
+        self.n_tokens = n_tokens
         
         # Multiple heads now output logits for classification
         self.heads = nn.ModuleList([
-            nn.Linear(hidden_dim, num_classes_per_head) for _ in range(num_heads)
+            CastedLinear(d_hidden, d_vocab) for _ in range(n_tokens)
         ])
         
         self.use_liger = use_liger
@@ -207,10 +207,19 @@ class MTP(nn.Module):
         """
         Implementation with CrossEntropyLoss for sequence prediction
         x: shape [batch_size, seq_len, input_dim]
-        targets: shape [batch_size, seq_len + num_heads]
+        targets: shape [batch_size, seq_len + n_tokens]
         """
-        # Step 1: Get shared representation
-        assert x.shape[1] == targets.shape[1] - self.num_heads
+
+        if x.ndim==3:
+            BATCH_SIZE = x.shape[0]
+            x = x.view(-1, x.shape[-1])
+        
+        if targets.ndim==2:
+            assert targets.shape[0] == BATCH_SIZE
+            targets = targets.view(-1)
+            
+        assert x.shape[0] == targets.shape[0] - (BATCH_SIZE*self.n_tokens)
+
         z = x  # [batch_size, seq_len, hidden_dim]
 
         # Step 2: Detach and enable grad tracking
@@ -220,18 +229,23 @@ class MTP(nn.Module):
         # Step 3: Sequential forward/backward through heads
         total_loss = 0
 
-        T = x.shape[1] # seq_len
-        for i in range(self.num_heads):
+        T = x.shape[0] # seq_len
+        for i in range(self.n_tokens):
             # Get shifted labels for this head
+            
             head_labels = targets[..., i:T+i] 
             head_labels = head_labels.contiguous().view(-1)
             
             if self.use_liger:
+                bias = self.heads[i].bias
+                if bias is not None:
+                    bias = bias.to(d.dtype)
+                    
                 loss = self.loss_fn.forward(
-                    self.heads[i].weight,
+                    self.heads[i].weight.to(d.dtype),
                     d,
                     head_labels,
-                    bias=self.heads[i].bias,
+                    bias=bias,
                 )
             else:
                 # Forward through head
@@ -348,47 +362,43 @@ class MTPGPT(nn.Module):
 
         # we process the input sequence without the last mtp.n_tokens
         # as usual.
-        k_excl_input_seq = input_seq[:, :-self.mtp.n_tokens] # exclude the last mtp.n_tokens
+        k_excl_input_seq = input_seq[..., :-self.mtp.n_tokens] # exclude the last mtp.n_tokens
         long_bm, short_bm = self.create_block_masks(k_excl_input_seq, sliding_window_num_blocks)
-
-        x = x0 = norm(self.embed(input_seq)[None]) 
+        x0 = norm(self.embed(input_seq)[None]) 
         # we need the embeddings for the last mtp.n_tokens also
         # Get embeddings for the target sequence tokens
         
         # NOTE does this allocate new memory?
-        x0_for_processing = x0[..., :-self.mtp.n_tokens]
+        sliced_x = x0_for_processing = x0[:, :-self.mtp.n_tokens, :]
         assert x0_for_processing.storage().data_ptr() == x0.storage().data_ptr(), "new memory allocated!!"
-        
         
         ve = self.value_embeds(k_excl_input_seq)
         assert len(ve) == len(self.blocks)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
         assert len(ve_enc) == self.num_encoder_layers and len(ve_dec) == self.num_decoder_layers
 
+
         # Store outputs for U-Net skip connections
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, ve_enc[i], x0_for_processing, block_masks[i])
-            skip_connections.append(x)
+            sliced_x = self.blocks[i](sliced_x, ve_enc[i], x0_for_processing, block_masks[i])
+            skip_connections.append(sliced_x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         block_masks.reverse()
         for i in range(self.num_decoder_layers):
-            x = x + self.skip_weights[i] * skip_connections.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0_for_processing, block_masks[i])
-        x = norm(x)
+            sliced_x = sliced_x + self.skip_weights[i] * skip_connections.pop()
+            sliced_x = self.blocks[self.num_encoder_layers + i](sliced_x, ve_dec[i], x0_for_processing, block_masks[i])
+        sliced_x = norm(sliced_x)
         
-        # Update the mtp.forward() call with embedded tokens
-        d = x.detach()
-        d.requires_grad = True
 
         if isinstance(self.mtp, DeepSeekV3MTP):
             raise NotImplementedError("DeepSeekV3MTP does not support forward()")
         else:
             loss = self.mtp.forward(
-                shared_trunk=d,
-                labels=target_seq
+                x=sliced_x,
+                targets=target_seq
             )
         
         return loss
