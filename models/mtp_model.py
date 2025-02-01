@@ -53,7 +53,7 @@ class DeepSeekV3MTP(nn.Module):
         else:
             self.loss_fn = torch.nn.CrossEntropyLoss()
 
-    def forward1(
+    def forward(
         self, 
         shared_trunk: Tensor, 
         x0: Tensor, 
@@ -177,82 +177,81 @@ class DeepSeekV3MTP(nn.Module):
         return loss_accum, None
 
 
+
+
 class MTP(nn.Module):
     def __init__(
         self, 
-        n_tokens : int,
-        d_hidden : int,
-        d_vocab : int,
-        use_liger : bool = True,
-        proj_fp8 : bool = True
+        hidden_dim: int, 
+        num_heads: int, 
+        num_classes_per_head: int,
+        use_liger: bool = False,
+        proj_fp8: bool = False
     ):
         super().__init__()
-        self.n_tokens = n_tokens
-        self.d_hidden = d_hidden
-        self.d_vocab = d_vocab
-        self.heads = torch.nn.ModuleList([
-            CastedLinear(d_hidden, d_vocab) for _ in range(n_tokens)
+        self.num_heads = num_heads
+        
+        # Multiple heads now output logits for classification
+        self.heads = nn.ModuleList([
+            nn.Linear(hidden_dim, num_classes_per_head) for _ in range(num_heads)
         ])
-        for head in self.heads:
-            head.weight.detach().zero_() # @Grad62304977
         
         self.use_liger = use_liger
         self.proj_fp8 = proj_fp8
-        
         if use_liger:
             self.loss_fn = LigerFusedLinearCrossEntropyLoss()
         else:
             self.loss_fn = torch.nn.CrossEntropyLoss()
         
+    def forward(self, x, targets):
+        """
+        Implementation with CrossEntropyLoss for sequence prediction
+        x: shape [batch_size, seq_len, input_dim]
+        targets: shape [batch_size, seq_len + num_heads]
+        """
+        # Step 1: Get shared representation
+        assert x.shape[1] == targets.shape[1] - self.num_heads
+        z = x  # [batch_size, seq_len, hidden_dim]
 
-    def forward(
-        self, 
-        shared_trunk: Tensor, 
-        x0: Tensor, 
-        block_mask: Tensor, 
-        labels: Tensor
-    ):
-        '''
-        shared_trunk : (B, T, H)
-        labels : (B, T+N_tokens)
+        # Step 2: Detach and enable grad tracking
+        d = z.detach()
+        d.requires_grad = True
         
-        
-        this function computes the gradient of the loss 
-        '''
-        assert shared_trunk.shape[1] == labels.shape[1] - self.n_tokens
-        
-        shared_trunk = shared_trunk.detach()
-        shared_trunk.requires_grad = True
-        
-        loss_accum = 0
-        for i in range(self.n_tokens):
-            # remove the first i tokens
-            shift_labels = labels[..., (1 + i) :].contiguous().view(-1) 
-            head : torch.nn.Linear = self.heads[i]
-            #TODO can this be done in fp8?
-            #TODO 30 * torch.sigmoid(logits.float() / 7.5) tanh softcapping??
+        # Step 3: Sequential forward/backward through heads
+        total_loss = 0
+
+        T = x.shape[1] # seq_len
+        for i in range(self.num_heads):
+            # Get shifted labels for this head
+            head_labels = targets[..., i:T+i] 
+            head_labels = head_labels.contiguous().view(-1)
+            
             if self.use_liger:
                 loss = self.loss_fn.forward(
-                    head.weight,
-                    shared_trunk, # merge batch and sequence dimensions
-                    shift_labels,
-                    bias=head.bias,
+                    self.heads[i].weight,
+                    d,
+                    head_labels,
+                    bias=self.heads[i].bias,
                 )
-                
             else:
-                #TODO use fp8 matmul??
+                # Forward through head
                 if self.proj_fp8:
-                    logits = lm_head_fp8(shared_trunk, head.weight)
+                    logits = lm_head_fp8(d, self.heads[i].weight)
                 else:
-                    logits = head.forward(shared_trunk)
-                
-                loss = self.loss_fn.forward(logits.view(-1, self.d_vocab), shift_labels)
+                    logits = self.heads[i](d)  # [batch_size, seq_len, num_classes]
+                # Reshape logits to match labels
+                logits = logits.view(-1, logits.size(-1))
+                loss = self.loss_fn(logits, head_labels)
+            total_loss += loss
             
-            #NOTE we call backward multiple times to accumulate the gradients to d(the shared trunk)
+            # Backward for this head
             loss.backward()
-            loss_accum += loss.detach() # We only need this for logging
-            
-        return loss_accum, shared_trunk.grad
+        
+        # Step 4: Backward through shared layer with accumulated gradients
+        z.backward(d.grad)
+        
+        return total_loss
+
 
 class MTPGPT(nn.Module):
     def __init__(
@@ -383,12 +382,15 @@ class MTPGPT(nn.Module):
         # Update the mtp.forward() call with embedded tokens
         d = x.detach()
         d.requires_grad = True
-        loss, shared_trunk_grad = self.mtp.forward(
-            shared_trunk=d,
-            x0=x0,
-            block_mask=long_bm,
-            labels=target_seq
-        )
-        d.backward(gradient=shared_trunk_grad)
-        return loss, x, d.grad 
+
+        if isinstance(self.mtp, DeepSeekV3MTP):
+            raise NotImplementedError("DeepSeekV3MTP does not support forward()")
+        else:
+            loss = self.mtp.forward(
+                shared_trunk=d,
+                labels=target_seq
+            )
+        
+        return loss
+
             

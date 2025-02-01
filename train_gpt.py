@@ -179,6 +179,10 @@ assert torch.cuda.is_available()
 device = torch.device(device, int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 
+# check if A10g device
+device_name = torch.cuda.get_device_name(device)
+is_a10g = device_name == "NVIDIA A10"
+
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 
@@ -186,15 +190,17 @@ dist.barrier()
 print(f"Rank: {rank}, World size: {world_size}")
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
+
+seq_len = 1024 if not is_a10g else 1024*64
+
 @dataclass
 class Hyperparameters:
     # data
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
 
-    seq_len = 64*1024 # FlexAttention sequence length
+    seq_len = seq_len #64*1024 # FlexAttention sequence length
     batch_size = world_size*seq_len   #TODO back to: 64*1024 # batch size in tokens
     num_iterations = 1393 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
@@ -203,14 +209,15 @@ class Hyperparameters:
     # implementation
     save_checkpoint = False
     use_liger = True
-    use_adam_mini = True 
+    use_adam_mini = False 
     use_mtp = False
     num_layers = 12
-    num_heads = 6
-    model_dim = 768
-    n_mtp_tokens : Optional[int] = 12
+    num_heads = 6 if not is_a10g else 1 # NOTE there will be bugs if this is not 1 when model_dim != 768
+    model_dim = 768 if not is_a10g else 32
+    val_tokens = 10485760 if not is_a10g else 16*seq_len # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    n_mtp_tokens : Optional[int] = 2
     use_wandb = True
-    torch_compile = True # for faster iteration speed
+    torch_compile = True if not is_a10g else False # for faster iteration speed
     gradient_accumulation_steps = math.ceil(8 / world_size) # emulated batch size  # New parameter for gradient accumulation
     effective_batch_size = batch_size * gradient_accumulation_steps  # Actual batch size after accumulation
     use_deepseek_mtp = True
@@ -218,7 +225,8 @@ class Hyperparameters:
 args = Hyperparameters()
 
 
-assert args.effective_batch_size == 1024*64*8, f"effective_batch_size is not {1024*64*8} got: {args.effective_batch_size}"
+if not is_a10g:
+    assert args.effective_batch_size == 1024*64*8, f"effective_batch_size is not {1024*64*8} got: {args.effective_batch_size}"
 
 def gen_name(args: Hyperparameters, uuid: uuid.UUID):
     return (
