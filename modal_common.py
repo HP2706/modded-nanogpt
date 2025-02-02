@@ -106,8 +106,6 @@ def ssh_function_wrapper():
     finally:
         cleanup_gpu()
         volume.commit()
-        
-
 
 KILL_AFTER = 60 * 60 * 14 # 14 hours
 @app.function(

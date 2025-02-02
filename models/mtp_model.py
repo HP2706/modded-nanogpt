@@ -1,3 +1,4 @@
+from typing import Dict
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -110,8 +111,8 @@ class DeepSeekV3MTP(nn.Module):
             
             if self.use_liger:
                 loss = self.loss_fn.forward(
-                    head.weight,
-                    current_hidden,
+                    head.weight.to(current_hidden.dtype), 
+                    current_hidden.view(-1, current_hidden.shape[-1]),
                     shift_targets,
                     bias=head.bias,
                 )
@@ -173,7 +174,7 @@ class MTP(nn.Module):
         x, 
         targets,
         with_backward: bool = False
-    ):
+    )-> Tensor | Dict[str, Tensor]:
         """
         Implementation with CrossEntropyLoss for sequence prediction
         x: shape [batch_size, seq_len, input_dim]
@@ -283,8 +284,8 @@ class MTPGPT(nn.Module):
             )
         else:
             self.mtp = MTP(
-                n_tokens=n_mtp_tokens,
                 d_hidden=model_dim,
+                n_tokens=n_mtp_tokens,
                 d_vocab=next_multiple_of_n(vocab_size, n=128),
                 use_liger=use_liger,
                 proj_fp8=proj_fp8
