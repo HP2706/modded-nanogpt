@@ -1,3 +1,5 @@
+import datetime
+from tarfile import BLOCKSIZE
 from tqdm import tqdm
 from itertools import chain
 import os
@@ -202,11 +204,17 @@ dist.barrier()
 print(f"Rank: {rank}, World size: {world_size}")
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
-
+BLOCK_SIZE = 128
 
 
 n_tokens = 2    
-seq_len = 64*(1024+n_tokens) if not is_a10g else 1024 + n_tokens
+
+use_mtp = True
+
+seq_len = 64*(1024) if not is_a10g else 16*(1024) 
+if use_mtp:
+    seq_len = seq_len + n_tokens # we add the n_tokens to the seq_len for the MTP
+
 
 @dataclass
 class Hyperparameters:
@@ -215,7 +223,7 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     # optimization
 
-    seq_len = seq_len #64*1024 # FlexAttention sequence length
+    seq_len = seq_len # FlexAttention sequence length
     batch_size = world_size*seq_len   #TODO back to: 64*1024 # batch size in tokens
     num_iterations = 1393 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
@@ -225,7 +233,7 @@ class Hyperparameters:
     save_checkpoint = False
     use_liger = False
     use_adam_mini = False 
-    use_mtp = False
+    use_mtp = use_mtp
     num_layers = 12
     num_heads = 6 if not is_a10g else 1 # NOTE there will be bugs if this is not 1 when model_dim != 768
     model_dim = 768 if not is_a10g else 32
@@ -243,9 +251,41 @@ args = Hyperparameters()
 if not is_a10g:
     assert args.effective_batch_size == 1024*64*8, f"effective_batch_size is not {1024*64*8} got: {args.effective_batch_size}"
 
-def gen_name(args: Hyperparameters, uuid: uuid.UUID):
+IS_MODAL = True
+
+# load data
+train_loader = distributed_data_generator(
+    args.train_files, 
+    args.batch_size,
+    rank, 
+    world_size,
+    from_path='/root/data' if IS_MODAL else None
+)
+
+if args.use_mtp:
+    model = MTPGPT(
+        vocab_size=50257,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        model_dim=args.model_dim,
+        n_mtp_tokens=args.n_mtp_tokens,
+        use_liger=args.use_liger,
+        use_deepseek_mtp=args.use_deepseek_mtp,
+        proj_fp8=args.proj_fp8
+    ).cuda()
+else:
+    model = GPT(
+        vocab_size=50257, 
+        num_layers=args.num_layers, 
+        num_heads=args.num_heads,
+        model_dim=args.model_dim,
+        use_fp8=args.proj_fp8
+    ).cuda() 
+
+
+def gen_name(model: GPT, args: Hyperparameters, uuid: uuid.UUID):
     return (
-        f'{uuid}_torch_compile={args.torch_compile}_batch_size={args.batch_size}'
+        f'{model.__class__.__name__}_torch_compile={args.torch_compile}_batch_size={args.batch_size}'
         f'_use_liger={args.use_liger}'
         f'_use_mtp={args.use_mtp}'
         f'_use_adam_mini={args.use_adam_mini}'
@@ -253,6 +293,7 @@ def gen_name(args: Hyperparameters, uuid: uuid.UUID):
         f'_num_heads={args.num_heads}'
         f'_model_dim={args.model_dim}'
         f'_n_mtp_tokens={args.n_mtp_tokens}'
+        f'_date={datetime.datetime.now().strftime("%Y-%m-%d")}'
     )
 
 # begin logging
@@ -265,7 +306,7 @@ if master_process:
     if args.use_wandb:
         import wandb
         os.environ["WANDB_API_KEY"] = 'a3469eb2df23f67e4d6907ebacf50ffb4ee664f7'
-        name = gen_name(args, run_id)
+        name = gen_name(model, args, run_id)
         wandb.init(
             project="modded-nanogpt", 
             name=name,
@@ -299,36 +340,6 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-IS_MODAL = True
-
-# load data
-train_loader = distributed_data_generator(
-    args.train_files, 
-    args.batch_size,
-    rank, 
-    world_size,
-    from_path='/root/data' if IS_MODAL else None
-)
-
-print0("Creating model", console=True)
-""" model = GPT(
-    vocab_size=50257, 
-    num_layers=args.num_layers, 
-    num_heads=args.num_heads,
-    model_dim=args.model_dim,
-    use_fp8=args.proj_fp8
-).cuda()  """
-
-model = MTPGPT(
-    vocab_size=50257,
-    num_layers=args.num_layers,
-    num_heads=args.num_heads,
-    model_dim=args.model_dim,
-    n_mtp_tokens=args.n_mtp_tokens,
-    use_liger=args.use_liger,
-    use_deepseek_mtp=args.use_deepseek_mtp,
-    proj_fp8=args.proj_fp8
-).cuda()
 
 from utils import numel_params_million
 print0(f"Model created with {numel_params_million(model)}M parameters", console=True)
@@ -337,9 +348,6 @@ for m in model.modules():
         m.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
-
-
-
 
 if not args.use_adam_mini:
     # collect the parameters to optimize
@@ -405,7 +413,11 @@ t0 = time.perf_counter()
 train_steps = args.num_iterations
 print0(f"Starting training loop for {train_steps} steps", console=True)
 total_tokens_seen = 0  # Track lifetime total tokens
-tokens_seen = 0  # Track tokens for throughput calculation
+accum_loss = 0
+if args.use_mtp:
+    accum_loss_dict = {}
+
+
 for step in range(train_steps + 1):
     print0(f"Beginning step {step}", console=True)
     last_step = (step == train_steps)
@@ -413,12 +425,12 @@ for step in range(train_steps + 1):
     if step == 10:
         print0("Resetting timing measurements", console=True)
         training_time_ms = 0
-        tokens_seen = 0  # Reset tokens count for throughput calculation only
         t0 = time.perf_counter()
     timed_steps = float("nan") if step <= 11 else (step - 10) + 1
 
-    window_size = next_multiple_of_n(1728 * step / train_steps, n=128)
-    print0(f"Window size for step {step}: {window_size}", console=True)
+    if step % args.gradient_accumulation_steps == 0:
+        window_size = next_multiple_of_n((1728 * step) * args.gradient_accumulation_steps / train_steps, n=128)
+        print0(f"Window size for step {step}: {window_size}", console=True)
 
     # Validation section
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
@@ -439,7 +451,11 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for val_step in tqdm(range(val_steps), desc="Validation steps", leave=False, disable=not master_process):
                 x, y = next(val_loader)
-                val_loss += model.forward(x, y, sw_num_blks(window_size))
+                if isinstance(model, MTPGPT):
+                    _ ,loss_dict = model.forward(x, y, sw_num_blks(window_size), with_backward=False)
+                    val_loss += loss_dict["loss_orig"] # this corresponds to the normal next token prediction loss
+                else:
+                    val_loss += model.forward(x, y, sw_num_blks(window_size))
         
         print0("Validation complete, reducing loss", console=True)
         val_loss /= val_steps
@@ -459,32 +475,40 @@ for step in range(train_steps + 1):
     print0(f"Loading training batch for step {step}", console=True)
     inputs, targets = next(train_loader)
     batch_tokens = inputs.numel() * world_size
-    tokens_seen += batch_tokens  # For throughput calculation
     total_tokens_seen += batch_tokens  # Lifetime total
     
     # Scale loss by gradient accumulation steps
     loss_scale = 1.0 / args.gradient_accumulation_steps
     
-        
-    for i, (input_seq, target_seq) in enumerate(zip(inputs.split(args.seq_len), targets.split(args.seq_len))):
-        out = model.forward(input_seq, target_seq, sw_num_blks(window_size))
-        if isinstance(out, tuple):
-            loss, shared_trunk_grad = out
-            print0(f"Starting backward pass for sequence {i+1}", console=True)
-            (loss_scale * shared_trunk_grad).backward()
-            print0(f"Completed backward pass for sequence {i+1}", console=True)
-        else:
-            loss = out
-            (loss_scale * loss).backward()
+    
+    if isinstance(model, MTPGPT):
+        loss, loss_dict = model.forward(inputs, targets, sw_num_blks(window_size), with_backward=True)
+    else:
+        loss = model.forward(inputs, targets, sw_num_blks(window_size))
+        (loss_scale * loss).backward()
+    
+    accum_loss += loss * loss_scale
+    if args.use_mtp:
+        for k, v in loss_dict.items():
+            if k in accum_loss_dict:
+                accum_loss_dict[k] += v * loss_scale
+            else:
+                accum_loss_dict[k] = v * loss_scale
 
-        wandb.log({"loss": loss.item()})
-            
+
     # Only perform optimizer step after accumulating gradients
     if (step + 1) % args.gradient_accumulation_steps == 0:
         print0("Reducing gradients", console=True)
         for param in model.parameters():
             if param.grad is not None:
-                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+                if isinstance(model, MTPGPT):
+                    # we multiply by loss_scale because we accumulated the loss over the gradient accumulation steps
+                    grad = loss_scale * param.grad
+                else:
+                    grad = param.grad
+                    
+                dist.all_reduce(grad, op=dist.ReduceOp.AVG)
+                param.grad = grad
             
         print0("Updating optimizers", console=True)
         frac = min(step / 300, 1)
@@ -497,18 +521,23 @@ for step in range(train_steps + 1):
             sched.step()
             
         model.zero_grad(set_to_none=True)
-
-    approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"Completed step {step} in {approx_time:.2f} ms", console=True)
-    print0(f"Loss: {loss.item()}", console=True)
-
-    tokens_per_sec = batch_tokens / (approx_time / 1000)
-    print0({
-        "step": step,
-        "loss": loss.item(),
-        "tokens_seen": total_tokens_seen,  # Log total lifetime tokens
-        "tokens_per_sec": tokens_per_sec
-    }, console=True)
+        approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"Completed step {step} in {approx_time:.2f} ms", console=True)
+        print0(f"Loss: {accum_loss if not args.use_mtp else accum_loss_dict['loss_orig']}", console=True)
+        
+        tokens_per_sec = total_tokens_seen / (approx_time / 1000)
+        print0({
+            "step": step,
+            "loss": accum_loss if not args.use_mtp else accum_loss_dict["loss_orig"],
+            "tokens_seen": total_tokens_seen,  # Log total lifetime tokens
+            "tokens_per_sec": tokens_per_sec,
+            **(accum_loss_dict if args.use_mtp else {}),
+        }, console=True)
+        
+        # reset accum_loss and accum_loss_dict
+        accum_loss = 0
+        if args.use_mtp:
+            accum_loss_dict = {}
 
 
 print0(

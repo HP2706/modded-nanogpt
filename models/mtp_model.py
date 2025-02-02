@@ -203,7 +203,12 @@ class MTP(nn.Module):
         else:
             self.loss_fn = torch.nn.CrossEntropyLoss()
         
-    def forward(self, x, targets):
+    def forward(
+        self, 
+        x, 
+        targets,
+        with_backward: bool = False
+    ):
         """
         Implementation with CrossEntropyLoss for sequence prediction
         x: shape [batch_size, seq_len, input_dim]
@@ -222,13 +227,18 @@ class MTP(nn.Module):
 
         z = x  # [batch_size, seq_len, hidden_dim]
 
-        # Step 2: Detach and enable grad tracking
-        d = z.detach()
-        d.requires_grad = True
-        
+        if with_backward:
+            # Step 2: Detach and enable grad tracking
+            d = z.detach()
+            d.requires_grad = True
+        else:
+            d = z
+            
         # Step 3: Sequential forward/backward through heads
         total_loss = 0
 
+
+        loss_dict = {}
         T = x.shape[0] # seq_len
         for i in range(self.n_tokens):
             # Get shifted labels for this head
@@ -257,14 +267,17 @@ class MTP(nn.Module):
                 logits = logits.view(-1, logits.size(-1))
                 loss = self.loss_fn(logits, head_labels)
             total_loss += loss
+            loss_dict[f"loss_{'orig' if i==0 else 'token_' + str(i)}"] = loss.detach()
             
-            # Backward for this head
-            loss.backward()
+            if with_backward:
+                # Backward for this head
+                loss.backward()
+
+        if with_backward:
+            # Step 4: Backward through shared layer with accumulated gradients
+            z.backward(d.grad)
         
-        # Step 4: Backward through shared layer with accumulated gradients
-        z.backward(d.grad)
-        
-        return total_loss
+        return total_loss, loss_dict
 
 
 class MTPGPT(nn.Module):
@@ -275,7 +288,7 @@ class MTPGPT(nn.Module):
         num_heads: int, 
         model_dim: int, 
         n_mtp_tokens: int, 
-        use_deepseek_mtp: bool = True,
+        use_deepseek_mtp: bool = False,
         use_liger: bool = True,
         proj_fp8: bool = True,
         device: torch.device = torch.device("cuda")
@@ -311,6 +324,8 @@ class MTPGPT(nn.Module):
                 use_liger=use_liger,
                 proj_fp8=proj_fp8
             )
+            
+        print(f"Using {self.mtp.__class__.__name__} for MTP")
             
     def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -356,7 +371,8 @@ class MTPGPT(nn.Module):
         self, 
         input_seq: Tensor, 
         target_seq: Tensor, 
-        sliding_window_num_blocks: Tensor
+        sliding_window_num_blocks: Tensor,
+        with_backward: bool = False
     )-> Tensor | tuple[Tensor, Tensor]:
         assert input_seq.ndim == 1
 
@@ -370,8 +386,6 @@ class MTPGPT(nn.Module):
         
         # NOTE does this allocate new memory?
         sliced_x = x0_for_processing = x0[:, :-self.mtp.n_tokens, :]
-        assert x0_for_processing.storage().data_ptr() == x0.storage().data_ptr(), "new memory allocated!!"
-        
         ve = self.value_embeds(k_excl_input_seq)
         assert len(ve) == len(self.blocks)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
@@ -398,7 +412,8 @@ class MTPGPT(nn.Module):
         else:
             loss = self.mtp.forward(
                 x=sliced_x,
-                targets=target_seq
+                targets=target_seq,
+                with_backward=with_backward
             )
         
         return loss

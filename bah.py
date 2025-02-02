@@ -4,9 +4,11 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
+from models.mtp_model import MTP
 def norm(x):
     result = F.rms_norm(x, (x.size(-1),))
     return result
+
 
 
 class DeepSeekV3MTP(nn.Module):
@@ -180,5 +182,55 @@ def test_mtp():
     print(f"MTP test passed with use_liger={use_liger}")
     print(f"Loss value: {loss.item()}")
 
+def test_mtp_original():
+    torch.manual_seed(42)
+    
+    # Model and data parameters
+    hidden_dim = 20
+    num_heads = 2
+    num_classes_per_head = 4
+    batch_size = 5
+    seq_len = 8  # Base sequence length
+    use_liger = False
+
+    # Create MTP model
+    model = MTP(hidden_dim, num_heads, num_classes_per_head, use_liger=use_liger, proj_fp8=False)
+    
+    # Create input tensor with requires_grad=True
+    x = torch.randn(batch_size, seq_len, hidden_dim, requires_grad=True)
+    # Create random target classes with extended sequence length
+    y = torch.randint(0, num_classes_per_head, (batch_size, seq_len + num_heads))
+    
+    # Test regular forward
+    loss = model.forward(x, y, with_backward=False)
+    print("Regular forward loss:", loss.item())
+    loss.backward()
+    
+    # Store gradients from regular backward
+    param_grads = [(name, param.grad.clone().detach()) for name, param in model.named_parameters()]
+    print("Regular backward gradients:", [(name, param.grad.norm()) for name, param in model.named_parameters() if param.grad is not None])
+    
+    # Reset gradients
+    model.zero_grad()
+    x.requires_grad = True
+    
+    # Test custom backward
+    loss = model.forward(x, y, with_backward=True)
+    print("Custom backward loss:", loss.item())
+    print("Custom backward gradients:", [(name, param.grad.norm()) for name, param in model.named_parameters() if param.grad is not None])
+    
+    # Compare gradients
+    named_params = list(model.named_parameters())
+    for i in range(len(named_params)):
+        is_correct = torch.allclose(named_params[i][1].grad, param_grads[i][1])
+        if not is_correct:
+            print("Gradient mismatch for", named_params[i][0], "got", named_params[i][1].grad.norm(), "expected", param_grads[i][1].norm())
+        else:
+            print("Gradient match for", named_params[i][0])
+    
+    print(f"MTP original test passed with use_liger={use_liger}")
+    print(f"Loss value: {loss.item()}")
+
 if __name__ == "__main__":
-    test_mtp()
+    #test_mtp()
+    test_mtp_original()
