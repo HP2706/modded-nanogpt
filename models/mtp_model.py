@@ -55,30 +55,40 @@ class DeepSeekV3MTP(nn.Module):
 
     def forward(
         self, 
-        shared_trunk: Tensor, 
+        x: Tensor, 
         x0: Tensor, 
         block_mask: BlockMask, 
-        labels: Tensor
+        targets: Tensor,
+        with_backward: bool = False
     ):
         """
-        shared_trunk: (B, T, H)
+        x: (B, T, H)
         next_token_embs: (B, N, H) where N is n_tokens
         x0: (B, T, H)
         block_mask: (B, T)
-        labels: (B, T+N)
+        targets: (B, T+N)
         """
-        assert shared_trunk.shape[1] == labels.shape[1] - self.n_tokens
+        if x.ndim== 3:
+            # we flattent to one batch sequence 
+            # as flexattention expects a single sequence 
+            x = x.view(1, -1, x.shape[-1])
+            x0 = x0.view(1,-1, x0.shape[-1])
+            
+        targets = targets.view(-1)    
+        assert x.shape[1] == targets.shape[0] - self.n_tokens
 
         
-        current_hidden = shared_trunk
-        T = shared_trunk.shape[1]
+        current_hidden = x
+        T = x.shape[1]
         
+        loss_dict = {}
         loss_accum = 0
         for i in range(self.n_tokens):
             # Create a fresh computation graph for each iteration
-            current_hidden = current_hidden.detach()
-            current_hidden.requires_grad = True
-            current_hidden.retain_grad()
+            if with_backward:
+                current_hidden = current_hidden.detach()
+                current_hidden.requires_grad = True
+                current_hidden.retain_grad()
             
             # Normalize inputs
             embs = x0[:, i:i+T, :]
@@ -95,14 +105,14 @@ class DeepSeekV3MTP(nn.Module):
             current_hidden = block.forward(h_prime, None, embs, block_mask)
             
             # Get predictions and compute loss
-            shift_labels = labels[..., i:i+T].contiguous().view(-1)
+            shift_targets = targets[i:i+T].contiguous().view(-1)
             head = self.shared_head
             
             if self.use_liger:
                 loss = self.loss_fn.forward(
                     head.weight,
                     current_hidden,
-                    shift_labels,
+                    shift_targets,
                     bias=head.bias,
                 )
             else:
@@ -110,72 +120,27 @@ class DeepSeekV3MTP(nn.Module):
                     logits = lm_head_fp8(current_hidden, head.weight)
                 else:
                     logits = head.forward(current_hidden)
-                loss = self.loss_fn.forward(logits.view(-1, self.d_vocab), shift_labels)
+                loss = self.loss_fn.forward(logits.view(-1, self.d_vocab), shift_targets)
             
-            # Compute gradients for this iteration
-            loss.backward(retain_graph=True)
-            loss_accum += loss.detach()
+            loss_dict[f"loss_{'orig' if i==0 else 'token_' + str(i)}"] = loss.detach()
             
-            # Accumulate gradients for shared_trunk using autograd.grad with allow_unused=True
-            grads = torch.autograd.grad(loss, shared_trunk, retain_graph=True, allow_unused=True)[0]
-            if grads is not None:  # Only accumulate if we got gradients
-                if shared_trunk.grad is None:
-                    shared_trunk.grad = grads
-                else:
-                    shared_trunk.grad += grads
-            
-        return loss_accum, shared_trunk.grad
+            if with_backward:
+                # Compute gradients for this iteration
+                loss.backward(retain_graph=True)
+                loss_accum += loss.detach()
+                
+                # Accumulate gradients for shared_trunk using autograd.grad with allow_unused=True
+                grads = torch.autograd.grad(loss, x, retain_graph=True, allow_unused=True)[0]
+                if grads is not None:  # Only accumulate if we got gradients
+                    if x.grad is None:
+                        x.grad = grads
+                    else:
+                        x.grad += grads
+            else:
+                loss_accum += loss
+        
+        return loss_accum, loss_dict
     
-    def forward2(self, shared_trunk: Tensor, next_token_embs: Tensor, x0: Tensor, block_mask, labels: Tensor):
-        """
-        shared_trunk: (B, T, H)
-        next_token_embs: (B, N, H) where N is n_tokens
-        x0: (B, T, H)
-        block_mask: (B, T)
-        labels: (B, T+N)
-        """
-        assert shared_trunk.shape[1] == labels.shape[1] - self.n_tokens
-        assert next_token_embs.shape[1] == self.n_tokens
-        
-        shared_trunk = shared_trunk
-        
-        current_hidden = shared_trunk
-        
-        loss_accum = 0
-        for i in range(self.n_tokens):
-            # Normalize inputs
-            x_norm = norm(current_hidden) # this corresponds 
-            next_norm = norm(next_token_embs[:, i])
-            
-            # Combine and project
-            combined = torch.cat([x_norm, next_norm], dim=-1)
-            h_prime = self.projs[i].forward(combined)
-            
-            # Pass through transformer block
-            block : Block = self.blocks[i]
-            current_hidden = block.forward(h_prime, None, x0, block_mask)
-            
-            # Get predictions and compute loss
-            shift_labels = labels[..., (1 + i):].contiguous().view(-1)
-            head = self.shared_head
-            
-            if self.use_liger:
-                loss = self.loss_fn.forward(
-                    head.weight,
-                    current_hidden,
-                    shift_labels,
-                    bias=head.bias,
-                )
-            else:
-                if self.proj_fp8:
-                    logits = lm_head_fp8(current_hidden, head.weight)
-                else:
-                    logits = head.forward(current_hidden)
-                loss = self.loss_fn.forward(logits.view(-1, self.d_vocab), shift_labels)
-            loss_accum += loss
-            
-        return loss_accum, None
-
 
 
 
@@ -408,7 +373,17 @@ class MTPGPT(nn.Module):
         
 
         if isinstance(self.mtp, DeepSeekV3MTP):
-            raise NotImplementedError("DeepSeekV3MTP does not support forward()")
+            loss, loss_dict = self.mtp.forward(
+                x=sliced_x,
+                x0=x0,
+                block_mask=long_bm,
+                targets=target_seq,
+                with_backward=False# NOTE it doesnt currently work with_backward
+            )
+            if with_backward:
+                loss.backward() # NOTE only to test how much slower it is
+                
+            return loss, loss_dict
         else:
             loss = self.mtp.forward(
                 x=sliced_x,
