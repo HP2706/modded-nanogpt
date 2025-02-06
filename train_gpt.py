@@ -1,15 +1,13 @@
-from operator import is_
-from aiohttp import TraceConfig
+from typing import Literal
 import fire
 import wandb
 import datetime
-from tarfile import BLOCKSIZE
-from sympy import use
 from tqdm import tqdm
 from itertools import chain
 import os
 import math
 import sys
+from optimizer import Muon
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 from typing import Optional, Union
@@ -29,118 +27,8 @@ from torch import Tensor, nn
 from models.Current_best_gpt import GPT
 from utils import next_multiple_of_n, unwrap
 from models.mtp_model import MTPGPT, MTP, DeepSeekV3MTP
+from models.ngpt import normalize_matrices, NGPT
 
-# -----------------------------------------------------------------------------
-# Muon optimizer
-
-@torch.compile
-def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
-    a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-    
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
-
-class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
-    parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-    - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven"t tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iteration steps to use.
-    """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
-        self.rank = rank
-        self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        params: list[Tensor] = [*params]
-        assert all(isinstance(p, Tensor) for p in params)
-        sizes = {p.numel() for p in params}
-        def create_update_buffer(size: int):
-            b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device=device)
-            return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(self.world_size)])
-        param_groups = [
-            dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size)) for size in sizes]
-        super().__init__(param_groups, defaults)
-
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            lr = group["lr"]
-            momentum = group["momentum"]
-            nesterov = group["nesterov"]
-            ns_steps = group["ns_steps"]
-            update_buffer = group["update_buffer"]
-            update_buffer_views: list[Tensor] = group["update_buffer_views"]
-            # generate weight updates in distributed fashion
-            params: list[Tensor] = group["params"]
-            handle = None
-            params_world = None
-            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
-                if params_world is None:
-                    return
-                assert handle is not None
-                handle.wait()
-                for p_world, g_world in zip(params_world, update_buffer_views):
-                    p_world.add_(
-                        g_world.view_as(p_world),
-                        alpha=-lr * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5,
-                    )
-            for base_i in range(len(params))[::self.world_size]:
-                if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
-                    g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1 - momentum)
-                    g = g.lerp_(buf, momentum) if nesterov else buf
-                    g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
-                else:
-                    g = update_buffer_views[self.rank]
-                update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
-                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
-                params_world = params[base_i : base_i + self.world_size]
-            update_prev()
 
 
 # -----------------------------------------------------------------------------
@@ -224,9 +112,9 @@ class TrainConfig:
     save_checkpoint: bool = False
     use_liger: bool = True
     use_adam_mini: bool = False
-    use_mtp: bool = False
     num_layers: int = 12
-    n_mtp_tokens: int = 2
+    n_mtp_tokens: Optional[int] = 2
+    model_dim: int = 768
     use_wandb: bool = True
     torch_compile: bool = True
     use_deepseek_mtp: bool = True
@@ -234,12 +122,13 @@ class TrainConfig:
     bfloat16: bool = False
     BLOCK_SIZE: int = 128
     IS_MODAL: bool = True
+    type : Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best'] = 'current-best'
 
     def __post_init__(self):
         # Set values that depend on is_a10g
         self.num_heads = 6 if not is_a10g else 1  # NOTE there will be bugs if this is not 1 when model_dim != 768
-        self.model_dim = 768 if not is_a10g else 32
-        if self.use_mtp:
+        if self.type in ['deepseek-mtp', 'base-mtp']:
+            assert self.n_mtp_tokens is not None, "n_mtp_tokens must be specified for deepseek-mtp or base-mtp"
             self.seq_len = self.seq_len + self.n_mtp_tokens  # we add the n_tokens to the seq_len for the MTP
         
         self.batch_size = world_size * self.seq_len
@@ -250,20 +139,10 @@ class TrainConfig:
 
 
 def gen_name(model: GPT, args: TrainConfig, uuid: uuid.UUID):
-    
-    if args.use_mtp:
-        if args.use_deepseek_mtp:
-            mtp_type = "deepseek"
-        else:
-            mtp_type = "mtp"
-    else:
-        mtp_type = ""
-    
     return (
-        f'{model.__class__.__name__}_torch_compile={args.torch_compile}_{mtp_type}'
+        f'{model.__class__.__name__}_torch_compile={args.torch_compile}_{args.type}'
         f'_batch_size={args.batch_size}'
         f'_use_liger={args.use_liger}'
-        f'_use_mtp={args.use_mtp}'
         f'_use_adam_mini={args.use_adam_mini}'
         f'_num_layers={args.num_layers}'
         f'_num_heads={args.num_heads}'
@@ -301,6 +180,7 @@ if master_process:
 
 def train(
     # data
+    type : Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best'] = 'current-best',
     train_files: str = "data/fineweb10B/fineweb_train_*.bin",
     val_files: str = "data/fineweb10B/fineweb_val_*.bin",
     # optimization
@@ -313,7 +193,6 @@ def train(
     save_checkpoint: bool = False,
     use_liger: bool = True,
     use_adam_mini: bool = False,
-    use_mtp: bool = False,
     num_layers: int = 12,
     n_mtp_tokens: int = 2,
     use_wandb: bool = True,
@@ -322,12 +201,15 @@ def train(
     proj_fp8: bool = False,
     bfloat16: bool = False,
     BLOCK_SIZE: int = 128,
-    IS_MODAL: bool = True
+    IS_MODAL: bool = True,
+    model_dim: int = 768,
 ):
     # Create config object from individual arguments
     args = TrainConfig(
+        type = type,
         train_files=train_files,
         val_files=val_files,
+        model_dim=model_dim,
         num_iterations=num_iterations,
         cooldown_frac=cooldown_frac,
         val_loss_every=val_loss_every,
@@ -335,7 +217,6 @@ def train(
         save_checkpoint=save_checkpoint,
         use_liger=use_liger,
         use_adam_mini=use_adam_mini,
-        use_mtp=use_mtp,
         num_layers=num_layers,
         n_mtp_tokens=n_mtp_tokens,
         use_wandb=use_wandb,
@@ -347,7 +228,8 @@ def train(
         IS_MODAL=IS_MODAL
     )
     
-    if args.use_mtp:
+    if args.type in ['deepseek-mtp', 'base-mtp']:
+        use_deepseek_mtp = args.type == 'deepseek-mtp'
         model = MTPGPT(
             vocab_size=50257,
             num_layers=args.num_layers,
@@ -355,10 +237,18 @@ def train(
             model_dim=args.model_dim,
             n_mtp_tokens=args.n_mtp_tokens,
             use_liger=args.use_liger,
-            use_deepseek_mtp=args.use_deepseek_mtp,
+            use_deepseek_mtp=use_deepseek_mtp,
             proj_fp8=args.proj_fp8
         ).cuda() 
-    else:
+    elif args.type == 'ngpt':
+        model = NGPT(
+            vocab_size=50257,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+            model_dim=args.model_dim,
+            use_fp8=args.proj_fp8
+        ).cuda()
+    elif args.type == 'current-best':
         model = GPT(
             vocab_size=50257, 
             num_layers=args.num_layers, 
@@ -366,6 +256,8 @@ def train(
             model_dim=args.model_dim,
             use_fp8=args.proj_fp8
         ).cuda() 
+    else:
+        raise ValueError(f"Invalid model type: {args.type}")
         
     if args.use_wandb:
         import wandb
@@ -379,7 +271,8 @@ def train(
 
 
 
-    if args.use_mtp:
+    if args.type in ['deepseek-mtp', 'base-mtp']:
+        assert args.n_mtp_tokens is not None, "n_mtp_tokens must be specified for deepseek-mtp or base-mtp"
         seq_len = seq_len + args.n_mtp_tokens # we add the n_tokens to the seq_len for the MTP
 
     # load data
@@ -390,9 +283,6 @@ def train(
         world_size,
         from_path='/root/data' if args.IS_MODAL else None
     )
-
-
-
 
     # begin by printing this file (the Python code)
     print0(code, console=False)
@@ -438,7 +328,7 @@ def train(
         # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
         # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
         optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-        optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+        optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, device=device)
         optimizers = [optimizer1, optimizer2]
     else:
         from adam_mini import Adam_mini
@@ -461,6 +351,7 @@ def train(
         w = min(t / args.cooldown_frac, 1.0) # 1 -> 0
         return w * 1.0 + (1 - w) * 0.1
     schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+    
     @lru_cache(1)
     def sw_num_blks(window_size: int):
         return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -483,7 +374,8 @@ def train(
     print0(f"Starting training loop for {train_steps} steps", console=True)
     total_tokens_seen = 0  # Track lifetime total tokens
     accum_loss = 0
-    if args.use_mtp:
+    IS_MTP = args.type in ['deepseek-mtp', 'base-mtp']
+    if IS_MTP:
         accum_loss_dict = {}
 
 
@@ -520,7 +412,7 @@ def train(
             with torch.no_grad():
                 for val_step in tqdm(range(val_steps), desc="Validation steps", leave=False, disable=not master_process):
                     x, y = next(val_loader)
-                    if args.use_mtp:
+                    if args.type in ['deepseek-mtp', 'base-mtp']:
                         _ ,loss_dict = model.forward(x, y, sw_num_blks(window_size), with_backward=False)
                         val_loss += loss_dict["loss_orig"] # this corresponds to the normal next token prediction loss
                     else:
@@ -550,7 +442,7 @@ def train(
         loss_scale = 1.0 / args.gradient_accumulation_steps
         
         
-        if args.use_mtp:
+        if args.type in ['deepseek-mtp', 'base-mtp']:
             assert isinstance(model, MTPGPT)
             loss, loss_dict = model.forward(inputs, targets, sw_num_blks(window_size), with_backward=True)
             for k, v in loss_dict.items():
@@ -570,7 +462,7 @@ def train(
             print0("Reducing gradients", console=True)
             for param in model.parameters():
                 if param.grad is not None:
-                    if args.use_mtp:
+                    if args.type in ['deepseek-mtp', 'base-mtp']:
                         # we multiply by loss_scale because we accumulated the loss over the gradient accumulation steps
                         grad = loss_scale * param.grad
                     else:
@@ -589,23 +481,26 @@ def train(
                 opt.step()
                 sched.step()
                 
+            if args.type == 'ngpt':
+                normalize_matrices(model)
+                
             model.zero_grad(set_to_none=True)
             approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
             print0(f"Completed step {step} in {approx_time:.2f} ms", console=True)
-            print0(f"Loss: {accum_loss if not args.use_mtp else accum_loss_dict['loss_orig']}", console=True)
+            print0(f"Loss: {accum_loss if not IS_MTP else accum_loss_dict['loss_orig']}", console=True)
             
             tokens_per_sec = total_tokens_seen / (approx_time / 1000)
             print0({
                 "step": step,
-                "loss": accum_loss if not args.use_mtp else accum_loss_dict["loss_orig"],
+                "loss": accum_loss if not IS_MTP else accum_loss_dict["loss_orig"],
                 "tokens_seen": total_tokens_seen,  # Log total lifetime tokens
                 "tokens_per_sec": tokens_per_sec,
-                **(accum_loss_dict if args.use_mtp else {}),
+                **(accum_loss_dict if IS_MTP else {}),
             }, console=True)
             
             # reset accum_loss and accum_loss_dict
             accum_loss = 0
-            if args.use_mtp:
+            if IS_MTP:
                 accum_loss_dict = {}
 
 

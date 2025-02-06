@@ -42,7 +42,15 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, layer_idx: int, head_dim=128):
+    def __init__(
+        self, 
+        dim: int, 
+        num_heads: int, 
+        layer_idx: int, 
+        head_dim=128,
+        use_liger=False,
+        attn_scale=0.12,
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -58,7 +66,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        self.attn_scale = 0.12
+        self.attn_scale = attn_scale
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
