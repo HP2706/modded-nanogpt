@@ -42,7 +42,7 @@ class UltraSparseMemoryMLP(nn.Module):
         r : int,
         query_heads: int,
         n_experts: int,
-        #num_cores: int = 4,  # H (head number) in the paper
+        num_cores: int = 4,  # H (head number) in the paper
         topk: int = 10,      # m (activated value number) in the paper
         virtual_expansion_factor: int = 4,  # E in the paper
         num_layers: int = 1,  # L in the paper
@@ -61,7 +61,9 @@ class UltraSparseMemoryMLP(nn.Module):
         self.virtual_expansion_factor_sqrt = int(math.sqrt(virtual_expansion_factor)) # type: ignore
         self.d_k = d_query*self.virtual_expansion_factor_sqrt 
         
-        self.C = nn.Parameter(torch.randn(r, r))
+        self.Cs = nn.ParameterList([nn.Parameter(torch.randn(r, r)) for _ in range(num_cores)])
+        
+        self.C = torch.stack([p for p in self.Cs]).sum(dim=0) # we just sum the cores
         self.K_row = nn.Parameter(torch.randn(r, n_experts, self.virtual_expansion_factor_sqrt, self.d_query // (r * 2)))
         self.K_col = nn.Parameter(torch.randn(r, n_experts, self.virtual_expansion_factor_sqrt, self.d_query // (r * 2)))
         # these are input dependent 
@@ -77,13 +79,20 @@ class UltraSparseMemoryMLP(nn.Module):
         # L = num_layers
         scale = (virtual_expansion_factor / (2 * topk * r * num_layers)) ** 0.5
         
-        # Physical memory split into cores V = [V^(1), ..., V^(h)]
-        self.physical_memory = nn.Parameter(torch.randn(n_experts, self.d_value) * scale)
+        # Split physical memory into cores V = [V^(1), ..., V^(h)]
+        d_value_per_core = d_value // num_cores
+        self.physical_memories = nn.ParameterList([
+            nn.Parameter(torch.randn(n_experts, d_value_per_core) * scale)
+            for _ in range(num_cores)
+        ])
         
-        # Virtual projectors for each core
+        # Virtual projectors for each core and expansion
         self.virtual_projectors = nn.ParameterList([
-            nn.Parameter(torch.randn(self.d_value, self.d_value) * scale)
-            for _ in range(virtual_expansion_factor)
+            nn.ParameterList([
+                nn.Parameter(torch.randn(d_value_per_core, d_value_per_core) * scale)
+                for _ in range(virtual_expansion_factor)
+            ])
+            for _ in range(num_cores)
         ])
         
     @property
@@ -103,7 +112,7 @@ class UltraSparseMemoryMLP(nn.Module):
         m : int,
     ) -> tuple[Float[Tensor, "n m"], Int[Tensor, "n m"]]:
         """
-        An implementation of Tucker Decomposed Query-Key Retrieval (TDQKR)
+        Multi-core scoring version of TDQKR
         """
         assert self.d_query % self.r == 0
         
@@ -131,57 +140,55 @@ class UltraSparseMemoryMLP(nn.Module):
         mask_row = mask_row.unsqueeze(1).expand(-1, self.r, -1, -1)  # [bs, r, exp, n]
         S_approx_row = mask_row * S_row  # Element-wise multiplication
 
-        # instead of topk(softmax(S_row.T × C × S_col)) (Equation 5)
+        # Compute individual score maps for each core
+        all_scores = []
+        for C_i in self.Cs:
+            grid_i = einsum(
+                S_approx_row, 
+                C_i, 
+                S_approx_col, 
+                "bs r exp_i n, r r, bs r exp_j n -> bs exp_i exp_j n"
+            )
+            grid_i = grid_i.view(grid_i.shape[0], self.virtual_expansion_factor, grid_i.shape[-1])
+            all_scores.append(grid_i)
         
-        # EQ 10, note that S_approx_row and S_approx_col are highly sparse so 
-        # this should not be a dense matrix multiplication
-        # TODO implement this in a sparse way with a kernel.
-        # NOTE we would need 
-        # 1 SparseDenseKernel
-        # 2 SparseSparseKernel
-        # 3 compute softmax without materializing the grid tensor. 
-        
-        grid = einsum(
-            S_approx_row, 
-            self.C, 
-            S_approx_col, 
-            "bs r exp_i n, r r, bs r exp_j n -> bs exp_i exp_j n"
-        ) # Maintain both exp dimensions to get E total combinations
-
-        # Now grid has shape [batch, sqrt(E), sqrt(E), n]
-        # We can reshape this to [batch, E, n] if needed by:
-        # grid = grid.reshape(batch_size, self.virtual_expansion_factor, n)
-
-        grid = grid.view(grid.shape[0], self.virtual_expansion_factor, grid.shape[-1])
+        # Sum scores across cores (Equation 16)
+        grid = sum(all_scores)
         Scores, Indices = torch.topk(torch.softmax(grid, dim=-1), m, dim=-1)
-        return Scores, Indices # [n, m]
+        return Scores, Indices
 
     def access_virtual_memory(
         self,
-        values : Float[Tensor, "b_x_seq_len exp m"],
-        indices : Int[Tensor, "b_x_seq_len exp m"],
+        values: Float[Tensor, "b_x_seq_len exp m"],
+        indices: Int[Tensor, "b_x_seq_len exp m"],
     ) -> Float[Tensor, "b_x_seq_len d_out"]:
         """
-        Access the virtual memory with the given values and indices.
+        Access the virtual memory with multi-core scoring
         """
-
-        # first we shuffle 
         permuted_indices = torch.randperm(indices.shape[-1])
         values = values[..., permuted_indices]
         indices = indices[..., permuted_indices]
         
-        out : Optional[Tensor] = None
-        for p in range(self.virtual_expansion_factor):
-            gathered = self.physical_memory[indices[:, p, :]]  # This will be [batch*seq_len, m, d_value]
-            vals = values[:, p, :]
-            
-            # we do the matrix multiplication in the last dimension
-            Non_virtual = einsum(gathered, vals, "bs m d_value, bs m -> bs d_value")
-            if out is None:
-                out = Non_virtual @ self.virtual_projectors[p]
-            else:
-                out += Non_virtual @ self.virtual_projectors[p]
+        out: Optional[Tensor] = None
         
+        # Process each core separately
+        for core_idx, physical_memory in enumerate(self.physical_memories):
+            core_out: Optional[Tensor] = None
+            
+            for p in range(self.virtual_expansion_factor):
+                gathered = physical_memory[indices[:, p, :]]
+                vals = values[:, p, :]
+                
+                Non_virtual = einsum(gathered, vals, "bs m d_value, bs m -> bs d_value")
+                if core_out is None:
+                    core_out = Non_virtual @ self.virtual_projectors[core_idx][p]
+                else:
+                    core_out += Non_virtual @ self.virtual_projectors[core_idx][p]
+            
+            if out is None:
+                out = core_out
+            else:
+                out = torch.cat([out, core_out], dim=-1)  # Concatenate along value dimension
         return cast(Tensor, out)
         
         
