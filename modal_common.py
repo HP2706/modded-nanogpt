@@ -1,8 +1,14 @@
 # use modal ssh
 import modal
+from modal.volume import FileEntry, FileEntryType
 from modal import Image, gpu, Secret, Volume, App
 import sys
 import os
+import inspect
+
+
+
+
 
 app = App(name="gpt2-speedrun")
 volume = Volume.from_name("gpt2-speedrun", create_if_missing=True)
@@ -16,7 +22,10 @@ image = Image.debian_slim(python_version="3.12").apt_install(
     ).run_commands(
         "mkdir /run/sshd",
     ).copy_local_file(
-        "~/.ssh/id_rsa.pub", "/root/.ssh/authorized_keys"
+        os.path.expanduser("~/.ssh/id_rsa.pub"), "/root/.ssh/authorized_keys"
+    ).copy_local_file(
+        'requirements.txt',
+        '/root/requirements.txt'
     ).pip_install(
         "uv",
     ).env(
@@ -30,17 +39,35 @@ image = Image.debian_slim(python_version="3.12").apt_install(
     ).run_commands(
         "git config --global user.name \"$GIT_USER_NAME\"",
         "git config --global user.email \"$GIT_USER_EMAIL\""
-    ).copy_local_dir(
-        '.',
-        remote_path="/root/project"
     ).run_commands(
         "uv pip install --pre torch==2.7.0.dev20250110+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade",
-        "uv pip install -r /root/project/requirements.txt"
+        "uv pip install -r /root/requirements.txt"
     ).env(
         {
             "HUGGINGFACE_HUB_CACHE": "/root/models/hf"
         }
     )
+
+
+def maybe_upload_project():
+    dirs = volume.listdir('data')
+
+    for d in dirs:
+        print("path: ", d.path)
+        end_name = d.path.split('/')[-1]
+        if end_name == 'project' and d.type == FileEntryType.DIRECTORY:
+            print("Project already uploaded")
+            return
+
+    print("Uploading project")
+    
+    with volume.batch_upload(force=True) as uploader:
+        uploader.put_directory(
+            '.',
+            remote_path="data/project"
+        )
+    
+
 
 
 def ssh_function_wrapper():
@@ -109,7 +136,7 @@ def ssh_function_wrapper():
 
 KILL_AFTER = 60 * 60 * 14 # 14 hours
 @app.function(
-    gpu=gpu.A10G(),
+    gpu='A10G',
     image=image, 
     timeout=KILL_AFTER,
     secrets=[Secret.from_name("wandb"), Secret.from_name("HF_SECRET")],
@@ -119,3 +146,38 @@ KILL_AFTER = 60 * 60 * 14 # 14 hours
 )
 def ssh_function():
     ssh_function_wrapper()
+    
+@app.function(
+    gpu=gpu.H100(),
+    image=image, 
+    timeout=KILL_AFTER,
+    secrets=[Secret.from_name("wandb"), Secret.from_name("HF_SECRET")],
+    volumes={
+        '/root/data': volume
+    }
+)
+def Run(**kwargs):
+    """
+    This function accepts the same arguments as the train function.
+    """
+    import subprocess
+    import os
+    
+    # Change to project directory
+    os.chdir("/root/project")
+    
+    kwargs_str = ' '.join([f'--{k} {v}' for k, v in kwargs.items()])
+    print(f"Running train with: {kwargs_str}")
+    os.system(f"torchrun train_gpt.py {kwargs_str}")
+
+
+
+
+@app.local_entrypoint()
+def main():
+    maybe_upload_project()
+    ssh_function.remote()
+    """ Run.remote(
+        type='current-best',
+        torch_compile=True,
+    ) """
