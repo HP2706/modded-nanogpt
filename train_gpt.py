@@ -1,3 +1,4 @@
+import inspect
 from typing import Literal
 import fire
 import wandb
@@ -129,7 +130,10 @@ class TrainConfig:
         self.num_heads = 6 if not is_a10g else 1  # NOTE there will be bugs if this is not 1 when model_dim != 768
         if self.type in ['deepseek-mtp', 'base-mtp']:
             assert self.n_mtp_tokens is not None, "n_mtp_tokens must be specified for deepseek-mtp or base-mtp"
-            self.seq_len = self.seq_len + self.n_mtp_tokens  # we add the n_tokens to the seq_len for the MTP
+            # First ensure base seq_len is multiple of 128
+            self.seq_len = next_multiple_of_n(self.seq_len, n=128)
+            # Then add the n_tokens
+            self.seq_len = self.seq_len + self.n_mtp_tokens
         
         self.batch_size = world_size * self.seq_len
         self.val_tokens = 10485760 if not is_a10g else 16*self.seq_len
@@ -189,7 +193,6 @@ def train(
     # evaluation and logging
     val_loss_every: int = 125,
     # implementation
-    seq_len: int = None,  # will be set based on is_a10g
     save_checkpoint: bool = False,
     use_liger: bool = True,
     use_adam_mini: bool = False,
@@ -210,6 +213,7 @@ def train(
         train_files=train_files,
         val_files=val_files,
         model_dim=model_dim,
+        n_mtp_tokens=n_mtp_tokens,
         num_iterations=num_iterations,
         cooldown_frac=cooldown_frac,
         val_loss_every=val_loss_every,
@@ -218,7 +222,6 @@ def train(
         use_liger=use_liger,
         use_adam_mini=use_adam_mini,
         num_layers=num_layers,
-        n_mtp_tokens=n_mtp_tokens,
         use_wandb=use_wandb,
         torch_compile=torch_compile,
         use_deepseek_mtp=use_deepseek_mtp,
@@ -230,6 +233,10 @@ def train(
     
     if args.type in ['deepseek-mtp', 'base-mtp']:
         use_deepseek_mtp = args.type == 'deepseek-mtp'
+        
+        print("args.n_mtp_tokens", args.n_mtp_tokens)
+        print("args.seq_len", args.seq_len)
+        
         model = MTPGPT(
             vocab_size=50257,
             num_layers=args.num_layers,
@@ -269,12 +276,6 @@ def train(
             config=args
         )
 
-
-
-    if args.type in ['deepseek-mtp', 'base-mtp']:
-        assert args.n_mtp_tokens is not None, "n_mtp_tokens must be specified for deepseek-mtp or base-mtp"
-        seq_len = seq_len + args.n_mtp_tokens # we add the n_tokens to the seq_len for the MTP
-
     # load data
     train_loader = distributed_data_generator(
         args.train_files, 
@@ -308,7 +309,23 @@ def train(
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
 
-    if not args.use_adam_mini:
+
+    if args.type == 'ngpt':
+        hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+        embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+        scalar_params = [p for p in model.parameters() if p.ndim < 2]
+
+        head_params = [model.lm_head.weight]
+        # init the optimizer(s)
+        adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+        # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+        # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+        # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+        optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
+        optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, device=device)
+        optimizers = [optimizer1, optimizer2]
+       
+    elif not args.use_adam_mini:
         # collect the parameters to optimize
         hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
         embed_params = [p for n, p in model.named_parameters() if "embed" in n]
@@ -330,6 +347,9 @@ def train(
         optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
         optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, device=device)
         optimizers = [optimizer1, optimizer2]
+        
+        
+        
     else:
         from adam_mini import Adam_mini
         
@@ -387,7 +407,6 @@ def train(
             print0("Resetting timing measurements", console=True)
             training_time_ms = 0
             t0 = time.perf_counter()
-        timed_steps = float("nan") if step <= 11 else (step - 10) + 1
 
         if step % args.gradient_accumulation_steps == 0:
             window_size = next_multiple_of_n((1728 * step) * args.gradient_accumulation_steps / train_steps, n=128)

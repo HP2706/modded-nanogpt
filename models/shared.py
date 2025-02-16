@@ -41,6 +41,8 @@ class Rotary(nn.Module):
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
+@torch.compile # no matter what we compile this nn.Module, bc we are using
+#flex attention
 class CausalSelfAttention(nn.Module):
     def __init__(
         self, 

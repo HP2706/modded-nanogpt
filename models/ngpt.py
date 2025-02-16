@@ -9,7 +9,7 @@ from typing import Optional
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from ops import lm_head_fp8
 from utils import next_multiple_of_n
-from models.shared import ValueEmbedding, Block, MLP, CastedLinear, Rotary
+from models.shared import ValueEmbedding, Block, MLP, CastedLinear, Rotary, CausalSelfAttention
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -47,47 +47,6 @@ class NMLP(nn.Module):
         return x
 
 
-
-class CausalSelfAttention(nn.Module):
-    def __init__(
-        self, 
-        dim: int, 
-        num_heads: int, 
-        layer_idx: int, 
-        head_dim=128,
-        use_liger=False,
-        attn_scale=0.12,
-    ):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        hdim = num_heads * head_dim
-        std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
-        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
-        # https://x.com/hi_tysam/status/1879699187107033311
-        self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
-        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(head_dim)
-        self.c_proj = CastedLinear(hdim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
-        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
-        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-
-    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
-        B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = cosine_normalize(q), cosine_normalize(k) # QK norm @Grad62304977
-        q, k = self.rotary(q), self.rotary(k)
-        if ve is not None:
-            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
-        else: # skip mid-layers token value embeddings by @YouJiacheng
-            v = self.lambdas[0] * v
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
-        return y
 
 class NBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, layer_idx: int, n_layers: Optional[int] = None):
@@ -236,7 +195,7 @@ class NGPT(nn.Module):
         
         logits = lm_head_fp8(x, self.lm_head.weight) if self.training and self.use_fp8 else self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
-        logits = 30 * torch.sigmoid(logits.float() / 7.5)
+        #logits = 30 * torch.sigmoid(logits.float() / 7.5)
         sz = self.sz * (self.sz_init_value/self.sz_init_scaling)
         logits = sz * logits
         
@@ -279,28 +238,3 @@ def normalize_matrices(model : NGPT):
         block.mlp.c_fc.weight.data.copy_(cosine_normalize(block.mlp.c_fc.weight.data, 1))               # n_proj, n_embd
         block.mlp.c_proj.weight.data.copy_(cosine_normalize(block.mlp.c_proj.weight.data, 0))   # n_embd, n_proj
           
-#https://github.com/NVIDIA/ngpt/blob/main/model.py
-def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-    # start with all of the candidate parameters
-    param_dict = {pn: p for pn, p in self.named_parameters()}
-    # filter out those that do not require grad
-    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-    # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-    # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-    optim_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': nodecay_params, 'weight_decay': 0.0}
-    ]
-    num_decay_params = sum(p.numel() for p in decay_params)
-    num_nodecay_params = sum(p.numel() for p in nodecay_params)
-    print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-    print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-    # Create AdamW optimizer and use the fused version if it is available
-    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-    use_fused = False#fused_available and device_type == 'cuda'
-    extra_args = dict(fused=True) if use_fused else dict()
-    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-    print(f"using fused AdamW: {use_fused}")
-    return optimizer
