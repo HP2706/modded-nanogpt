@@ -14,6 +14,8 @@ app = App(name="gpt2-speedrun")
 volume = Volume.from_name("gpt2-speedrun", create_if_missing=True)
 
 
+    
+
 #get to root of the project
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 image = Image.debian_slim(python_version="3.12").apt_install(
@@ -40,8 +42,8 @@ image = Image.debian_slim(python_version="3.12").apt_install(
         "git config --global user.name \"$GIT_USER_NAME\"",
         "git config --global user.email \"$GIT_USER_EMAIL\""
     ).run_commands(
-        "uv pip install --pre torch==2.7.0.dev20250110+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade",
-        "uv pip install -r /root/requirements.txt"
+        "pip install --pre torch==2.7.0.dev20250110+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade",
+        "pip install -r /root/requirements.txt"
     ).env(
         {
             "HUGGINGFACE_HUB_CACHE": "/root/models/hf"
@@ -50,14 +52,15 @@ image = Image.debian_slim(python_version="3.12").apt_install(
 
 
 def maybe_upload_project():
-    dirs = volume.listdir('data')
+    if 'data' in volume.listdir(''):
+        dirs = volume.listdir('data')
+        for d in dirs:
+            print("path: ", d.path)
+            end_name = d.path.split('/')[-1]
+            if end_name == 'project' and d.type == FileEntryType.DIRECTORY:
+                print("Project already uploaded")
+                return
 
-    for d in dirs:
-        print("path: ", d.path)
-        end_name = d.path.split('/')[-1]
-        if end_name == 'project' and d.type == FileEntryType.DIRECTORY:
-            print("Project already uploaded")
-            return
 
     print("Uploading project")
     
@@ -156,7 +159,7 @@ def ssh_function():
         '/root/data': volume
     }
 )
-def Run(**kwargs):
+def train_gpt(**kwargs):
     """
     This function accepts the same arguments as the train function.
     """
@@ -170,14 +173,3 @@ def Run(**kwargs):
     print(f"Running train with: {kwargs_str}")
     os.system(f"torchrun train_gpt.py {kwargs_str}")
 
-
-
-
-@app.local_entrypoint()
-def main():
-    maybe_upload_project()
-    ssh_function.remote()
-    """ Run.remote(
-        type='current-best',
-        torch_compile=True,
-    ) """

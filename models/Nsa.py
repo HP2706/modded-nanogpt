@@ -1,24 +1,47 @@
+from typing import cast
 import torch
-from torch import Tensor, nn
 import torch.nn.functional as F
-import torch.distributed as dist
-# use of FlexAttention contributed by @KoszarskyB
-from torch.nn.attention.flex_attention import BlockMask, flex_attention
-from ops import lm_head_fp8
+from torch import nn, Tensor
 from utils import next_multiple_of_n
-from models.shared import ValueEmbedding, Block, CausalSelfAttention, MLP, CastedLinear, norm, create_block_masks
-import os
-import sys
-with open(sys.argv[0]) as f:
-    code = f.read() # read the code of this file ASAP, for logging
+from native_sparse_attention_pytorch import SparseAttention
+from ops import lm_head_fp8
+from models.shared import ValueEmbedding, norm, CastedLinear, MLP, create_block_masks
+from torch.nn.attention.flex_attention import BlockMask
+
+class NSABlock(nn.Module):
+    def __init__(
+        self, 
+        dim: int, 
+        num_heads: int, 
+        layer_idx: int,
+        sliding_window_size: int = 32,
+        compress_block_size: int = 4,
+        selection_block_size: int = 4,
+        num_selected_blocks: int = 4,
+    ):
+        super().__init__()
+        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
+        self.attn = SparseAttention(
+            dim=dim, 
+            dim_head=dim//num_heads, 
+            heads=num_heads, 
+            sliding_window_size=sliding_window_size,
+            compress_block_size=compress_block_size,
+            selection_block_size=selection_block_size,
+            num_selected_blocks=num_selected_blocks
+        ) if layer_idx != 7 else None
+        self.mlp = MLP(dim)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+
+    def forward(self, x : Tensor, ve : Tensor, x0 : Tensor, block_mask : BlockMask):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        if self.attn is not None:
+            x = x + self.attn.forward(norm(x), sliding_window_flex_mask=None, fine_selection_flex_mask=None)
+        x = x + self.mlp(norm(x))
+        return x
 
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
-# torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
-
-
-class GPT(nn.Module):
+class NSA_GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
@@ -26,13 +49,33 @@ class GPT(nn.Module):
         num_heads: int,
         model_dim: int,
         use_fp8: bool = False,
+        sliding_window_size: int = 32,
+        compress_block_size: int = 4,
+        selection_block_size: int = 4,
+        num_selected_blocks: int = 4,
     ):
         super().__init__()
         self.use_fp8 = use_fp8
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         self.value_embeds = ValueEmbedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx) for layer_idx in range(num_layers)])
+        
+        self.blocks = cast(list[NSABlock], nn.ModuleList([
+            NSABlock(
+                dim=model_dim, 
+                num_heads=num_heads, 
+                layer_idx=i,
+                sliding_window_size=sliding_window_size,
+                compress_block_size=compress_block_size,
+                selection_block_size=selection_block_size,
+                num_selected_blocks=num_selected_blocks
+            ) for i in range(num_layers)
+        ]))
+        
+        
+        # [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm] 
+        # do reverse for decoder
+        
         # U-net design by @brendanh0gan
         self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
@@ -59,7 +102,7 @@ class GPT(nn.Module):
         # Encoder pass - process only the first half of the blocks
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
+            x = self.blocks[i].forward(x, ve_enc[i], x0, block_masks[i])
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         block_masks.reverse()

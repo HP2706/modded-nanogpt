@@ -124,3 +124,45 @@ class ValueEmbedding(nn.Module):
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         ve = [ve[0], ve[1], ve[2], None, None, None, None, None, None, ve[0], ve[1], ve[2]]
         return ve
+
+
+
+def create_block_masks(input_seq: Tensor, sliding_window_num_blocks: Tensor):
+    BLOCK_SIZE = 128
+    docs = (input_seq == 50256).cumsum(0)
+
+    def document_causal(b, h, q_idx, kv_idx):
+        causal_mask = q_idx >= kv_idx
+        document_mask = docs[q_idx] == docs[kv_idx]
+        return causal_mask & document_mask
+
+    def dense_to_ordered(dense_mask: Tensor):
+        num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
+        indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+        return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+
+    # manual block mask creation by @YouJiacheng
+    assert len(input_seq) % BLOCK_SIZE == 0
+    NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
+    block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
+    any_causal_bm = block_idx[:, None] >= block_idx
+    all_causal_bm = block_idx[:, None] > block_idx
+    docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
+    docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+    any_document_bm = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
+    all_document_bm = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+    any_bm = any_causal_bm & any_document_bm
+    all_bm = all_causal_bm & all_document_bm
+    partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(any_bm & ~all_bm)
+    full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
+    def build_bm(sw_num_blocks: Tensor) -> BlockMask:
+        return BlockMask.from_kv_blocks(
+            torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(sw_num_blocks - full_kv_num_blocks, 1)),
+            partial_kv_indices,
+            torch.clamp_max(full_kv_num_blocks, sw_num_blocks - 1),
+            full_kv_indices,
+            BLOCK_SIZE=BLOCK_SIZE,
+            mask_mod=document_causal,
+        )
+    # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
+    return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)

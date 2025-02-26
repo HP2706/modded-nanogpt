@@ -3,10 +3,14 @@ tqdm
 torch
 huggingface-hub
 liger-kernel
-wandb
+wandb<=0.18.7
 transformers
 adam-mini
 transformers
 tqdm
 hf-transfer
 fire
+native-sparse-attention-pytorch # https://github.com/lucidrains/native-sparse-attention-pytorch
+local-attention>=1.11.1
+einx>=0.3.0
+einops>=0.8.1

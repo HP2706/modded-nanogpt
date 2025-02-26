@@ -29,7 +29,7 @@ from models.Current_best_gpt import GPT
 from utils import next_multiple_of_n, unwrap
 from models.mtp_model import MTPGPT, MTP, DeepSeekV3MTP
 from models.ngpt import normalize_matrices, NGPT
-
+from models.Nsa import NSA_GPT
 
 
 # -----------------------------------------------------------------------------
@@ -123,7 +123,11 @@ class TrainConfig:
     bfloat16: bool = False
     BLOCK_SIZE: int = 128
     IS_MODAL: bool = True
-    type : Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best'] = 'current-best'
+    type : Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best', 'nsa'] = 'current-best'
+    sliding_window_size: Optional[int] = None
+    num_selected_blocks: Optional[int] = None
+    compress_block_size: Optional[int] = None
+    selection_block_size: Optional[int] = None
 
     def __post_init__(self):
         # Set values that depend on is_a10g
@@ -184,7 +188,7 @@ if master_process:
 
 def train(
     # data
-    type : Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best'] = 'current-best',
+    type : Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best', 'nsa'] = 'current-best',
     train_files: str = "data/fineweb10B/fineweb_train_*.bin",
     val_files: str = "data/fineweb10B/fineweb_val_*.bin",
     # optimization
@@ -206,6 +210,10 @@ def train(
     BLOCK_SIZE: int = 128,
     IS_MODAL: bool = True,
     model_dim: int = 768,
+    sliding_window_size: Optional[int] = 32,
+    num_selected_blocks: Optional[int] = 4,
+    compress_block_size: Optional[int] = 4,
+    selection_block_size: Optional[int] = 4,
 ):
     # Create config object from individual arguments
     args = TrainConfig(
@@ -228,7 +236,11 @@ def train(
         proj_fp8=proj_fp8,
         bfloat16=bfloat16,
         BLOCK_SIZE=BLOCK_SIZE,
-        IS_MODAL=IS_MODAL
+        IS_MODAL=IS_MODAL,
+        sliding_window_size=sliding_window_size,
+        num_selected_blocks=num_selected_blocks,
+        compress_block_size=compress_block_size,
+        selection_block_size=selection_block_size
     )
     
     if args.type in ['deepseek-mtp', 'base-mtp']:
@@ -263,6 +275,17 @@ def train(
             model_dim=args.model_dim,
             use_fp8=args.proj_fp8
         ).cuda() 
+    elif args.type == 'nsa':
+        model = NSA_GPT(
+            vocab_size=50257,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+            model_dim=args.model_dim,
+            sliding_window_size=args.sliding_window_size,
+            compress_block_size=args.compress_block_size,
+            selection_block_size=args.selection_block_size,
+            num_selected_blocks=args.num_selected_blocks
+        ).cuda()
     else:
         raise ValueError(f"Invalid model type: {args.type}")
         
@@ -282,7 +305,7 @@ def train(
         args.batch_size,
         rank, 
         world_size,
-        from_path='/root/data' if args.IS_MODAL else None
+        from_path='/root/data/data/project' if args.IS_MODAL else None
     )
 
     # begin by printing this file (the Python code)
@@ -425,7 +448,7 @@ def train(
                 val_batch_size, 
                 rank, 
                 world_size,
-                from_path='/root/data' if args.IS_MODAL else None
+                from_path='/root/data/data/project' if args.IS_MODAL else None
             )
             val_loss = 0
             with torch.no_grad():
