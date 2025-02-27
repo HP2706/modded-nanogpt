@@ -100,34 +100,34 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 @dataclass
 class TrainConfig:
+    # optimization
+    num_iterations: int
+    cooldown_frac: float
+    # evaluation and logging
+    val_loss_every: int
+    # implementation
+    seq_len: int
+    save_checkpoint: bool
+    use_liger: bool
+    use_adam_mini: bool
+    num_layers: int
+    n_mtp_tokens: Optional[int]
+    model_dim: int
+    use_wandb: bool
+    torch_compile: bool
+    use_deepseek_mtp: bool
+    proj_fp8: bool
+    bfloat16: bool
+    BLOCK_SIZE: int
+    IS_MODAL: bool
+    type: Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best', 'nsa']
+    sliding_window_size: Optional[int]
+    num_selected_blocks: Optional[int]
+    compress_block_size: Optional[int]
+    selection_block_size: Optional[int]
     # data
     train_files: str = "data/fineweb10B/fineweb_train_*.bin"  # input .bin to train on
     val_files: str = "data/fineweb10B/fineweb_val_*.bin"  # input .bin to eval validation loss on
-    # optimization
-    num_iterations: int = 1393  # number of iterations to run
-    cooldown_frac: float = 0.4  # fraction of training spent cooling down the learning rate
-    # evaluation and logging
-    val_loss_every: int = 125  # every how many steps to evaluate val loss? 0 for only at the end
-    # implementation
-    seq_len: int = 64*(1024) if not is_a10g else 16*(1024)
-    save_checkpoint: bool = False
-    use_liger: bool = True
-    use_adam_mini: bool = False
-    num_layers: int = 12
-    n_mtp_tokens: Optional[int] = 2
-    model_dim: int = 768
-    use_wandb: bool = True
-    torch_compile: bool = True
-    use_deepseek_mtp: bool = True
-    proj_fp8: bool = False
-    bfloat16: bool = False
-    BLOCK_SIZE: int = 128
-    IS_MODAL: bool = True
-    type : Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best', 'nsa'] = 'current-best'
-    sliding_window_size: Optional[int] = None
-    num_selected_blocks: Optional[int] = None
-    compress_block_size: Optional[int] = None
-    selection_block_size: Optional[int] = None
 
     def __post_init__(self):
         # Set values that depend on is_a10g
@@ -188,7 +188,7 @@ if master_process:
 
 def train(
     # data
-    type : Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best', 'nsa'] = 'current-best',
+    type: Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best', 'nsa'] = 'current-best',
     train_files: str = "data/fineweb10B/fineweb_train_*.bin",
     val_files: str = "data/fineweb10B/fineweb_val_*.bin",
     # optimization
@@ -211,18 +211,16 @@ def train(
     BLOCK_SIZE: int = 128,
     IS_MODAL: bool = True,
     model_dim: int = 768,
-    sliding_window_size: Optional[int] = 32,
-    num_selected_blocks: Optional[int] = 4,
-    compress_block_size: Optional[int] = 4,
-    selection_block_size: Optional[int] = 4,
+    sliding_window_size: Optional[int] = None,
+    num_selected_blocks: Optional[int] = None,
+    compress_block_size: Optional[int] = None,
+    selection_block_size: Optional[int] = None,
 ):
     # Create config object from individual arguments
     args = TrainConfig(
-        type = type,
+        type=type,
         train_files=train_files,
         val_files=val_files,
-        model_dim=model_dim,
-        n_mtp_tokens=n_mtp_tokens,
         num_iterations=num_iterations,
         cooldown_frac=cooldown_frac,
         val_loss_every=val_loss_every,
@@ -231,6 +229,8 @@ def train(
         use_liger=use_liger,
         use_adam_mini=use_adam_mini,
         num_layers=num_layers,
+        n_mtp_tokens=n_mtp_tokens,
+        model_dim=model_dim,
         use_wandb=use_wandb,
         torch_compile=torch_compile,
         use_deepseek_mtp=use_deepseek_mtp,
@@ -553,7 +553,5 @@ def train(
         console=True
     )
     dist.destroy_process_group()
-
-
 
 fire.Fire(train)

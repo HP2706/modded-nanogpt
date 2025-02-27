@@ -52,7 +52,7 @@ image = Image.debian_slim(python_version="3.12").apt_install(
 
 
 def maybe_upload_project():
-    if 'data' in volume.listdir(''):
+    if 'data' in [x.path for x in volume.listdir('')]:
         dirs = volume.listdir('data')
         for d in dirs:
             print("path: ", d.path)
@@ -152,7 +152,7 @@ def ssh_function():
     ssh_function_wrapper()
     
 @app.function(
-    gpu=gpu.H100(),
+    gpu='H100',
     image=image, 
     timeout=KILL_AFTER,
     secrets=[Secret.from_name("wandb"), Secret.from_name("HF_SECRET")],
@@ -173,33 +173,3 @@ def train_gpt(**kwargs):
     kwargs_str = ' '.join([f'--{k} {v}' for k, v in kwargs.items()])
     print(f"Running train with: {kwargs_str}")
     os.system(f"torchrun train_gpt.py {kwargs_str}")
-
-@app.function(
-    gpu=gpu.H100(),
-    image=image, 
-    timeout=KILL_AFTER,
-    secrets=[Secret.from_name("wandb"), Secret.from_name("HF_SECRET")],
-    volumes={
-        '/root/data': volume
-    }
-)
-def train_gpt_cli():
-    """
-    Command-line interface version of train_gpt that parses sys.argv
-    """
-    import sys
-    import os
-    
-    # Upload project files if needed
-    maybe_upload_project()
-    
-    # Change to project directory
-    os.chdir("/root/data/project")
-    
-    # Get command line args (skip the first one which is the script name)
-    args = sys.argv[1:]
-    args_str = ' '.join(args)
-    
-    print(f"Running train with CLI args: {args_str}")
-    os.system(f"torchrun train_gpt.py {args_str}")
-

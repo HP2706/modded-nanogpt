@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from utils import next_multiple_of_n, round_down_multiple, round_up_multiple
 from native_sparse_attention_pytorch import SparseAttention
-from native_sparse_attention_pytorch.native_sparse_attention import create_fine_mask, interpolate_1d, max_neg_value, pad_at_dim, straight_through
+from native_sparse_attention_pytorch.native_sparse_attention import create_fine_mask, interpolate_1d, max_neg_value, pad_at_dim, straight_through, attend
 from ops import lm_head_fp8
 from models.shared import ValueEmbedding, norm, CastedLinear, MLP, create_block_masks, Rotary
 from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_block_mask
@@ -48,11 +48,13 @@ def create_fine_mask(seq_len, fine_block_size) -> MASK_FN:
 
 
 class CompressMLP(nn.Module):
-    def __init__(self, dim: int, compress_block_size: int, expansion_factor : int = 4):
+    def __init__(self, head_dim: int, compress_block_size: int, expansion_factor : int = 4):
         super().__init__()
-        input_dim = compress_block_size * dim
-        self.c_fc = CastedLinear(input_dim, input_dim * expansion_factor)
-        self.c_proj = CastedLinear(input_dim * expansion_factor, input_dim)
+        
+        compress_dim = compress_block_size * head_dim
+        hidden_dim = compress_dim * expansion_factor
+        self.c_fc = CastedLinear(compress_dim, hidden_dim)
+        self.c_proj = CastedLinear(hidden_dim, head_dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
@@ -77,6 +79,8 @@ class NSA_Attention(nn.Module):
         query_heads_share_selected_kv : bool = True,
         attn_scale: float = 0.12,
         use_triton_kernel : bool = False,
+        use_fine_flex_attention : bool = False,
+        use_diff_topk : bool = True,
     ):
         '''
         NSA sparse attention as by https://arxiv.org/abs/2502.11089
@@ -97,7 +101,6 @@ class NSA_Attention(nn.Module):
             and perform standard softmax attention on this block of tokens.
         '''
         super().__init__()
-        
         self.num_heads = heads
         self.head_dim = dim_head
         hdim = self.num_heads * self.head_dim
@@ -115,22 +118,25 @@ class NSA_Attention(nn.Module):
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = attn_scale
         self.num_selected_blocks = num_selected_blocks
-        
-        self.query_heads_share_selected_kv = query_heads_share_selected_kv
-        self.use_triton_kernel = use_triton_kernel
-
 
         # NEW STUFF
+        
+        assert not (use_fine_flex_attention is True and use_triton_kernel is True), "Cannot use both fine flex attention and triton kernel"
+        self.query_heads_share_selected_kv = query_heads_share_selected_kv
+        self.num_grouped_queries = heads 
+
+        self.use_fine_flex_attention = use_fine_flex_attention
+        self.use_triton_kernel = use_triton_kernel
         # used for compression of both k and v cache
-        self.k_compress = CompressMLP(dim, compress_block_size)
-        self.v_compress = CompressMLP(dim, compress_block_size)
+        self.k_compress = CompressMLP(dim_head, compress_block_size=compress_block_size)
+        self.v_compress = CompressMLP(dim_head, compress_block_size=compress_block_size)
         self.compress_block_size = compress_block_size
         self.selection_block_size = selection_block_size
         
         self.compress_mem_kv = nn.Parameter(torch.zeros(2, heads, num_compressed_mem_kv, dim_head))
         self.k_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
         self.v_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
-
+        self.flip_h_seq_dim = Rearrange('b n h d -> b h n d')
 
         strategy_combine_mlp = nn.Linear(dim, 3 * heads)
 
@@ -152,36 +158,41 @@ class NSA_Attention(nn.Module):
         
         self.split_compress_window = Rearrange('b h (w n) d -> b h w n d', n = compress_block_size)
 
-
+        self.use_diff_topk = use_diff_topk
         # combining heads
         self.combine_heads = nn.Linear(hdim, dim, bias = False)
 
     def compressed_attention(
         self,
-        q: Float[Tensor, 'b t h d'],
-        k: Float[Tensor, 'b t h d'],
-        v: Float[Tensor, 'b t h d'],
-        mem_ck : Float[Tensor, 'b h n d'],
-        mem_cv : Float[Tensor, 'b h n d'],
+        q: Float[Tensor, 'b h t d_head'],
+        k: Float[Tensor, 'b h t d_head'],
+        v: Float[Tensor, 'b h t d_head'],
+        mem_ck : Float[Tensor, 'b h n_d'],
+        mem_cv : Float[Tensor, 'b h n_d'],
         num_mem_compress_kv : int,
         num_compress_blocks : int,
         compress_divisible_seq_len : int,
         
         device: torch.device
-    ) -> tuple[Float[Tensor, 'b t h d'], Float[Tensor, 'b t t']]:
-        B = q.size(0) # batch size
-        T = q.size(1) # sequence length
+    ) -> tuple[Float[Tensor, 'b h t d'], Float[Tensor, 'b h t t']]:
+        T = q.size(2) # sequence length
         
         k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
         v_pos = repeat(self.v_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
 
-        k_compress_input = self.split_compress_window(k[..., :compress_divisible_seq_len, :] + k_pos)
-        v_compress_input = self.split_compress_window(v[..., :compress_divisible_seq_len, :] + v_pos)
 
-        cq = q
+        k  = k[..., :compress_divisible_seq_len, :, :] + k_pos.unsqueeze(0) # expand to batch dim
+        v  = v[..., :compress_divisible_seq_len, :, :] + v_pos.unsqueeze(0)
+        
+        k_compress_input = self.split_compress_window(k)
+        v_compress_input = self.split_compress_window(v)
+
+        k_compress_input = rearrange(k_compress_input, 'b h w n d -> b h w (n d)') # we concatenate tokens
+        v_compress_input = rearrange(v_compress_input, 'b h w n d -> b h w (n d)')
+        
         ck = self.k_compress(k_compress_input)   # Equation (7) of the Native Sparse Attention paper
         cv = self.v_compress(v_compress_input)
-
+        cq = q
 
         ck = torch.cat((mem_ck, ck), dim = -2)
         cv = torch.cat((mem_cv, cv), dim = -2)
@@ -192,30 +203,34 @@ class NSA_Attention(nn.Module):
 
         cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
 
-
-        from native_sparse_attention_pytorch.native_sparse_attention import attend
         compressed_attn_out, csim = attend(cq, ck, cv, mask = cmask, return_sim = True)
         return compressed_attn_out, csim
     
     def fine_attention(
         self,
-        fq: Float[Tensor, 'b t h d'],
-        fk: Float[Tensor, 'b t h d'],
-        fv: Float[Tensor, 'b t h d'],
-        csim : Float[Tensor, 'b t t'],
+        fq: Float[Tensor, 'b h t d_head'],
+        fk: Float[Tensor, 'b h t d_head'],
+        fv: Float[Tensor, 'b h t d_head'],
+        csim : Float[Tensor, 'b h t t'],
         num_mem_compress_kv : int,
         num_compress_blocks : int,
         num_fine_blocks : int,
         fine_divisible_seq_len : int,
         device: torch.device,
         disable_triton_kernel : bool = False,
-    ) -> Float[Tensor, 'b t h d']:
-
+    ) -> Float[Tensor, 'b h t d_head']:
+        B, S = fq.size(0), fq.size(2)
 
         importance_scores = csim[..., num_mem_compress_kv:]
-
         num_selected = min(self.num_selected_blocks, num_compress_blocks)
         has_selected_kv_for_fine_attn = num_selected > 0
+
+
+        if self.query_heads_share_selected_kv:
+            importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
+            fine_num_grouped_queries = self.num_grouped_queries
+        else:
+            fine_num_grouped_queries = 1
 
 
         # handle if compress block size does not equal to the fine block size
@@ -223,16 +238,13 @@ class NSA_Attention(nn.Module):
         # first we expand all the compressed scores to the full sequence length, then average within each fine / selection block size - pad on the right to 0s, which should be fine as sliding window convers the local anyways
 
         if has_selected_kv_for_fine_attn:
-
             if self.compress_block_size != self.selection_block_size:
 
                 compress_seq_len = num_compress_blocks * self.compress_block_size
-
                 if self.interpolated_importance_score:
                     importance_scores = interpolate_1d(importance_scores, compress_seq_len)
                 else:
                     importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
-
                 padding = fine_divisible_seq_len - compress_seq_len
 
                 fine_query_seq_len = importance_scores.shape[-2]
@@ -249,19 +261,19 @@ class NSA_Attention(nn.Module):
 
                 importance_scores = reduce(importance_scores, '... (j block_size) -> ... j', 'mean', block_size = self.selection_block_size)
 
+
             importance_scores = F.pad(importance_scores, (1, 0), value = -1e3)
             importance_scores = importance_scores.softmax(dim = -1)
             importance_scores = importance_scores[..., 1:]
-
             # handle if number of total blocks is less than number to select for fine attention
 
             # get the top-n kv segments for fine attention
-
             selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim = -1)
 
             if self.use_diff_topk:
                 gates = straight_through(selected_importance_values, 1.)
                 gates = gates.cumprod(dim = -1)[..., -1]
+                gates = repeat(gates, 'b h ... -> b (h qh) ...', qh = fine_num_grouped_queries)
 
 
             if self.use_triton_kernel and not disable_triton_kernel:
@@ -286,8 +298,8 @@ class NSA_Attention(nn.Module):
             else:
                 fmask = selected_importance_values > 1e-10
 
-                if seq_len < fine_divisible_seq_len:
-                    remainder = fine_divisible_seq_len - seq_len
+                if S < fine_divisible_seq_len:
+                    remainder = fine_divisible_seq_len - S
                     fk = pad_at_dim(fk, (0, remainder), value = 0., dim = -2)
                     fv = pad_at_dim(fv, (0, remainder), value = 0., dim = -2)
                     fq = pad_at_dim(fq, (0, remainder), value = 0., dim = -2)
@@ -302,13 +314,13 @@ class NSA_Attention(nn.Module):
                 # handle block causal diagonal in the diagram, but run experiments without to see
 
                 fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
-                fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = selected_block_indices.shape[1])
+                fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = B, h = selected_block_indices.shape[1])
                 selected_block_indices = torch.cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
 
                 fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
 
                 causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
-                causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = fmask.shape[1])
+                causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = B, h = fmask.shape[1])
 
                 fmask = torch.cat((fmask, causal_mask), dim = -2)
                 fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
@@ -340,7 +352,7 @@ class NSA_Attention(nn.Module):
 
                 fq = rearrange(fq, 'b (h qh) ... -> b h qh ...', qh = fine_num_grouped_queries)
 
-                fsim = einsum(fq, fk, 'b h qh i d, b h i j d -> b h qh i j') * self.scale
+                fsim = einsum(fq, fk, 'b h qh i d, b h i j d -> b h qh i j') * self.attn_scale
 
                 mask_value = max_neg_value(fsim)
 
@@ -352,13 +364,21 @@ class NSA_Attention(nn.Module):
 
                 fine_attn_out = rearrange(fine_attn_out, 'b h qh ... -> b (h qh) ...')
 
-                fine_attn_out = fine_attn_out[..., :seq_len, :]
+                fine_attn_out = fine_attn_out[..., :S, :]
 
             # handle maybe gating
 
             if self.use_diff_topk:
-                gates = gates[..., :seq_len]
-                fine_attn_out = einx.multiply('b h n, b h n d -> b h n d', gates, fine_attn_out)
+                gates = gates[..., :S]
+                assert self.num_heads == fine_num_grouped_queries, (
+                    f"num heads must equal num grouped queries, got {self.num_heads} and {self.num_grouped_queries}"
+                )
+                fine_attn_out = einx.multiply(
+                    'b h n, b h n d -> b h n d', 
+                    gates, 
+                    fine_attn_out, 
+                    h = self.num_heads
+                )
 
         else:
             # if only first block, just do a simple block causal
@@ -386,7 +406,10 @@ class NSA_Attention(nn.Module):
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k, v = map(self.split_heads, (q, k, v))
+        
+        q = self.flip_h_seq_dim(q)
+        k = self.flip_h_seq_dim(k)
+        v = self.flip_h_seq_dim(v)
         
         # learnable interpolation between token value embeddings ve 
         # and current token value embeddings v
@@ -397,8 +420,6 @@ class NSA_Attention(nn.Module):
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = self.lambdas[0] * v
             
-            
-        
         mem_ck, mem_cv = repeat(self.compress_mem_kv, 'kv ... -> kv b ...', b = B)
         num_mem_compress_kv = mem_ck.shape[-2]
         # step 1: compressed attention
@@ -419,32 +440,41 @@ class NSA_Attention(nn.Module):
         q, k = self.rotary(q), self.rotary(k)
         
         fine_attn_out = self.fine_attention(
-            q=q, 
-            k=k, 
-            v=v, 
+            fq=q, 
+            fk=k, 
+            fv=v, 
             csim=csim, 
             num_mem_compress_kv=num_mem_compress_kv, 
             num_compress_blocks=num_compress_blocks, 
             num_fine_blocks=num_fine_blocks, 
+            fine_divisible_seq_len=fine_divisible_seq_len,
             device=x.device
         )
         
         
         # step 3: sliding window attention
+        # NOTE not tested yet
         sliding_window_attn_out = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         sliding_window_attn_out = sliding_window_attn_out.contiguous()
         
-        
+        print("x shape: ", x.shape)
         strategy_weighted_combine = self.to_strategy_combine(x)
+        print("strategy_weighted_combine shape: ", strategy_weighted_combine.shape)
+        
+        merged_attn = torch.stack([
+            compressed_attn_out, 
+            fine_attn_out, 
+            sliding_window_attn_out
+        ], dim = 0)
+        
+        print("merged_attn shape: ", merged_attn.shape)
+        
         out = einops.einsum(
             strategy_weighted_combine, 
-            torch.stack([
-                compressed_attn_out, 
-                fine_attn_out, 
-                sliding_window_attn_out]
-            ),  
+            merged_attn,
             'b h n s, s b h n d -> b h n d'
         )
+        out = einops.rearrange(out, 'b h n d -> b n (h d)')
 
         out = self.combine_heads(out) # map from 3*dim to dim
         return out

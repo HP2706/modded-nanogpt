@@ -1,68 +1,181 @@
-from models.mtp_model import DeepSeekV3MTP
-import torch.nn as nn
 import torch
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask
-torch.manual_seed(0)
-# test if the gradients accumulate correctly
-
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-else:
-    device = torch.device("cpu")
-
-emb = nn.Linear(10, 8).to(device)
-unembed = nn.Linear(10, 128).to(device)
-input = torch.randn(1, 10, 10).to(device) # 1 batch size, 10 tokens, 10 features
-labels = torch.randint(0, 128, (1, 10)).to(device)
-
-n_tokens = 2 # two mtp tokens
-mtp = DeepSeekV3MTP(
-    n_tokens=n_tokens,
-    d_hidden=8,
-    d_vocab=128,
-    num_heads=1,
-    use_liger=False,
-    proj_fp8=False,
-).to(device)
-
-
+import torch.nn as nn
+import torch.nn.functional as F
+from models.Nsa import NSA_Attention
+from einops import repeat, rearrange
 from torch.nn.attention.flex_attention import create_block_mask
 
-def causal(b, h, q_idx, kv_idx):
-    return q_idx >= kv_idx
+# Setup a small test for NSA compressed attention and fine attention
 
-# Because the sparsity pattern is independent of batch and heads, we'll set them to None (which broadcasts them) 
-block_mask = create_block_mask(causal, B=None, H=None, Q_LEN=8, KV_LEN=8)
-x = x0 = emb.forward(input)
+def test_nsa_components():
+    # Parameters
+    batch_size = 1
+    seq_len = 1024
+    model_dim = 768
+    num_heads = 12
+    head_dim = model_dim // num_heads
+    
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    
+    # Create NSA_Attention module
+    attn = NSA_Attention(
+        dim=model_dim,
+        dim_head=head_dim,
+        heads=num_heads,
+        layer_idx=0,
+        sliding_window_size=32,
+        compress_block_size=4,
+        selection_block_size=4,
+        num_selected_blocks=4,
+        query_heads_share_selected_kv=True
+    ).to(device)
+    
+    # Create random input tensors
+    x = torch.randn(batch_size, seq_len, model_dim).to(device)
+    
+    # Process input to get q, k, v
+    B, T = x.size(0), x.size(1)
+    proj = F.linear(x, attn.qkv_w.flatten(end_dim=1).type_as(x))
+    print(f"proj shape: {proj.shape}")
+    q, k, v = proj.view(B, 3 * attn.num_heads, T , attn.head_dim).chunk(3, dim=1)
 
-hidden_states = x[:, :-n_tokens]
+    
+    # Setup for compressed attention
+    compress_divisible_seq_len = (T // attn.compress_block_size) * attn.compress_block_size
+    num_compress_blocks = compress_divisible_seq_len // attn.compress_block_size
+    
+    # Setup for fine attention
+    fine_divisible_seq_len = ((T + attn.selection_block_size - 1) // attn.selection_block_size) * attn.selection_block_size
+    num_fine_blocks = fine_divisible_seq_len // attn.selection_block_size
+    
+    # Get memory components
+    mem_ck, mem_cv = repeat(attn.compress_mem_kv, 'kv ... -> kv b ...', b=B)
+    num_mem_compress_kv = mem_ck.shape[-2]
+    
+    # Step 1: Run compressed attention
+    print("Running compressed attention...")
+    compressed_attn_out, csim = attn.compressed_attention(
+        q=q,
+        k=k,
+        v=v,
+        mem_ck=mem_ck,
+        mem_cv=mem_cv,
+        num_mem_compress_kv=num_mem_compress_kv,
+        num_compress_blocks=num_compress_blocks,
+        compress_divisible_seq_len=compress_divisible_seq_len,
+        device=x.device
+    )
+    print(f"Compressed attention output shape: {compressed_attn_out.shape}")
+    print(f"Compressed similarity matrix shape: {csim.shape}")
+    
 
-print('hidden_states', hidden_states.shape)
-print('x', x.shape)
-print('x0', x0.shape)
-print('labels', labels.shape)
-d = x.detach()
-d.requires_grad = True
-loss, shared_trunk_grad = mtp.forward1(
-    d, 
-    x0, 
-    block_mask,
-    labels
-)
+    # Step 2: Apply rotary embeddings for fine attention
+    q_rotary, k_rotary = attn.rotary(q), attn.rotary(k)
+    
+    # Run fine attention
+    print("Running fine attention...")
+    fine_attn_out = attn.fine_attention(
+        fq=q_rotary,
+        fk=k_rotary,
+        fv=v,
+        csim=csim,
+        num_mem_compress_kv=num_mem_compress_kv,
+        num_compress_blocks=num_compress_blocks,
+        num_fine_blocks=num_fine_blocks,
+        fine_divisible_seq_len=fine_divisible_seq_len,
+        device=x.device
+    )
+    print(f"Fine attention output shape: {fine_attn_out.shape}")
+    
+    # Combine the outputs (just for demonstration)
+    print("Combining outputs...")
+    combined_output = 0.5 * compressed_attn_out + 0.5 * fine_attn_out
+    combined_output = attn.merge_heads(combined_output)
+    print(f"Combined output shape: {combined_output.shape}")
+    
+    return {
+        "compressed_output": compressed_attn_out,
+        "fine_output": fine_attn_out,
+        "combined_output": combined_output
+    }
 
-grad = d.backward(gradient=shared_trunk_grad)
-x.backward(gradient=grad)
+def test_nsa_forward():
+    """Test the full NSA_Attention forward pass"""
+    # Parameters
+    batch_size = 1
+    seq_len = 1024
+    model_dim = 768
+    num_heads = 12
+    head_dim = model_dim // num_heads
+    sliding_window_size = 32
+    
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    
+    # Create NSA_Attention module
+    attn = NSA_Attention(
+        dim=model_dim,
+        dim_head=head_dim,
+        heads=num_heads,
+        layer_idx=0,
+        sliding_window_size=sliding_window_size,
+        compress_block_size=4,
+        selection_block_size=4,
+        num_selected_blocks=4,
+        query_heads_share_selected_kv=True,
+        use_fine_flex_attention=False,
+        use_diff_topk=True
+    ).to(device)
+    
+    # Create random input tensors
+    x = torch.randn(batch_size, seq_len, model_dim).to(device)
+    
+    # Create a value embedding (can be None for testing)
+    ve = None
+    
+    # Create a sliding window block mask for attention
+    def sliding_window_mask_fn(b_idx, h_idx, q_idx, kv_idx):
+        # Simple sliding window mask
+        return abs(q_idx - kv_idx) <= sliding_window_size
+    
+    """ block_mask = create_block_mask(
+        sliding_window_mask_fn, 
+        B=batch_size, 
+        H=num_heads, 
+        Q_LEN=seq_len, 
+        KV_LEN=seq_len, 
+        _compile=True
+    ) """
+    
+    # Run the full forward pass
+    print("\nTesting full NSA_Attention forward pass...")
+    output = attn.forward(x, ve, None)
+    
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {output.shape}")
+    
+    # Verify output shape matches input shape
+    assert output.shape == x.shape, f"Output shape {output.shape} doesn't match input shape {x.shape}"
+    
+    return {
+        "input": x,
+        "output": output
+    }
 
-print("emb.weight.grad", emb.weight.grad.norm())
-
-torch.zero_grad()
-""" 
-loss, _ = mtp.forward(
-    hidden_states, 
-    x0, 
-    torch.ones(8, 8), 
-    labels)
-
-loss.backward()
-
-print("emb.weight.grad", emb.weight.grad.norm()) """
+if __name__ == "__main__":
+    # Test individual components
+    #component_results = test_nsa_components()
+    #print("Component tests completed successfully!")
+    
+    # Test full forward pass
+    forward_results = test_nsa_forward()
+    print("Forward pass test completed successfully!")
