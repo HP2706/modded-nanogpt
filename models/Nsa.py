@@ -18,6 +18,18 @@ from typing import Callable
 
 MASK_FN = Callable[[Tensor, int], BlockMask]
 
+def create_sliding_mask(seq_len, window_size) -> BlockMask:
+    def sliding_mask(_, __, q_idx, kv_idx):
+        causal_mask = q_idx >= kv_idx
+
+        sliding_mask = (q_idx - kv_idx) <= window_size
+        causal_mask = causal_mask & sliding_mask
+
+        return causal_mask
+
+    block_mask = create_block_mask(sliding_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
+    return block_mask
+
 def create_fine_mask(seq_len, fine_block_size) -> MASK_FN:
 
     def inner(selected_block_indices: Tensor, num_grouped_queries = 1):
@@ -81,6 +93,7 @@ class NSA_Attention(nn.Module):
         use_triton_kernel : bool = False,
         use_fine_flex_attention : bool = False,
         use_diff_topk : bool = True,
+        interpolated_importance_score : bool = False,
     ):
         '''
         NSA sparse attention as by https://arxiv.org/abs/2502.11089
@@ -123,7 +136,8 @@ class NSA_Attention(nn.Module):
         
         assert not (use_fine_flex_attention is True and use_triton_kernel is True), "Cannot use both fine flex attention and triton kernel"
         self.query_heads_share_selected_kv = query_heads_share_selected_kv
-        self.num_grouped_queries = heads 
+        self.num_grouped_queries = 1 # num_heads / num_kv_heads(num_heads)
+        self.interpolated_importance_score = interpolated_importance_score
 
         self.use_fine_flex_attention = use_fine_flex_attention
         self.use_triton_kernel = use_triton_kernel
@@ -225,13 +239,11 @@ class NSA_Attention(nn.Module):
         num_selected = min(self.num_selected_blocks, num_compress_blocks)
         has_selected_kv_for_fine_attn = num_selected > 0
 
-
         if self.query_heads_share_selected_kv:
             importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
             fine_num_grouped_queries = self.num_grouped_queries
         else:
             fine_num_grouped_queries = 1
-
 
         # handle if compress block size does not equal to the fine block size
         # cannot parse their equation, so will just improvise
@@ -261,7 +273,6 @@ class NSA_Attention(nn.Module):
 
                 importance_scores = reduce(importance_scores, '... (j block_size) -> ... j', 'mean', block_size = self.selection_block_size)
 
-
             importance_scores = F.pad(importance_scores, (1, 0), value = -1e3)
             importance_scores = importance_scores.softmax(dim = -1)
             importance_scores = importance_scores[..., 1:]
@@ -269,7 +280,6 @@ class NSA_Attention(nn.Module):
 
             # get the top-n kv segments for fine attention
             selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim = -1)
-
             if self.use_diff_topk:
                 gates = straight_through(selected_importance_values, 1.)
                 gates = gates.cumprod(dim = -1)[..., -1]
@@ -281,8 +291,14 @@ class NSA_Attention(nn.Module):
 
                 fmask = selected_importance_values > 1e-10
 
+                seq_len = fq.shape[-2]
+                q_heads, kv_heads, sel_heads = fq.shape[1], fk.shape[1], selected_block_indices.shape[1]
+                assert sel_heads in (q_heads, kv_heads)
+                
                 fine_attn_out = native_sparse_attend(
-                    fq, fk, fv,
+                    fq, 
+                    fk, 
+                    fv,
                     self.selection_block_size,
                     selected_block_indices,
                     fmask
@@ -370,10 +386,8 @@ class NSA_Attention(nn.Module):
 
             if self.use_diff_topk:
                 gates = gates[..., :S]
-                assert self.num_heads == fine_num_grouped_queries, (
-                    f"num heads must equal num grouped queries, got {self.num_heads} and {self.num_grouped_queries}"
-                )
-                fine_attn_out = einx.multiply(
+                
+                fine_attn_out : Float[Tensor, 'b h t d'] = einx.multiply(
                     'b h n, b h n d -> b h n d', 
                     gates, 
                     fine_attn_out, 
@@ -385,7 +399,7 @@ class NSA_Attention(nn.Module):
 
             seq_len = fk.shape[-2]
             fmask = causal_mask = torch.ones((seq_len, seq_len), device = device, dtype = torch.bool).tril()
-            fine_attn_out = F.scaled_dot_product_attention(fq, fk, fv, attn_mask = fmask)
+            fine_attn_out : Float[Tensor, 'b h t d'] = F.scaled_dot_product_attention(fq, fk, fv, attn_mask = fmask)
 
         return fine_attn_out
         
@@ -436,6 +450,9 @@ class NSA_Attention(nn.Module):
             device = x.device
         )
             
+            
+        return x  # for testing
+        
         # step 2: fine selection attention
         q, k = self.rotary(q), self.rotary(k)
         
@@ -454,20 +471,14 @@ class NSA_Attention(nn.Module):
         
         # step 3: sliding window attention
         # NOTE not tested yet
-        sliding_window_attn_out = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
-        sliding_window_attn_out = sliding_window_attn_out.contiguous()
-        
-        print("x shape: ", x.shape)
+        sliding_window_attn_out = flex_attention(q, k, v, block_mask=block_mask, scale=self.attn_scale).contiguous()
         strategy_weighted_combine = self.to_strategy_combine(x)
-        print("strategy_weighted_combine shape: ", strategy_weighted_combine.shape)
         
         merged_attn = torch.stack([
             compressed_attn_out, 
             fine_attn_out, 
             sliding_window_attn_out
         ], dim = 0)
-        
-        print("merged_attn shape: ", merged_attn.shape)
         
         out = einops.einsum(
             strategy_weighted_combine, 

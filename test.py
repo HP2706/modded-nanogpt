@@ -128,11 +128,12 @@ def test_nsa_forward():
         heads=num_heads,
         layer_idx=0,
         sliding_window_size=sliding_window_size,
-        compress_block_size=4,
-        selection_block_size=4,
-        num_selected_blocks=4,
+        compress_block_size=16,
+        selection_block_size=16,
+        num_selected_blocks=16,
         query_heads_share_selected_kv=True,
         use_fine_flex_attention=False,
+        use_triton_kernel=True,
         use_diff_topk=True
     ).to(device)
     
@@ -147,18 +148,21 @@ def test_nsa_forward():
         # Simple sliding window mask
         return abs(q_idx - kv_idx) <= sliding_window_size
     
-    """ block_mask = create_block_mask(
-        sliding_window_mask_fn, 
-        B=batch_size, 
-        H=num_heads, 
-        Q_LEN=seq_len, 
-        KV_LEN=seq_len, 
-        _compile=True
-    ) """
+    if torch.cuda.is_available():
+        block_mask = create_block_mask(
+            sliding_window_mask_fn, 
+            B=batch_size, 
+            H=num_heads, 
+            Q_LEN=seq_len, 
+            KV_LEN=seq_len, 
+            _compile=True
+        )
+    else:
+        block_mask = None
     
     # Run the full forward pass
     print("\nTesting full NSA_Attention forward pass...")
-    output = attn.forward(x, ve, None)
+    output = attn.forward(x, ve, block_mask)
     
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {output.shape}")
@@ -171,11 +175,35 @@ def test_nsa_forward():
         "output": output
     }
 
+
+def test_external_nsa():
+    from native_sparse_attention_pytorch.native_sparse_attention import SparseAttention
+    import torch
+
+    attn = SparseAttention(
+        dim=768,
+        dim_head=768 // 12,
+        heads=12,
+        sliding_window_size=32,
+        compress_block_size=16,
+        num_selected_blocks=16,
+        selection_block_size=16,
+        num_compressed_mem_kv=1,
+        query_heads_share_selected_kv=True,
+        use_triton_kernel=True,
+        use_diff_topk=True,
+    )
+
+    device = torch.device("cuda")
+    inp = torch.randn(1, 1024, 768).to(device)
+    attn.to(device)
+    attn.forward(inp)
+
 if __name__ == "__main__":
     # Test individual components
     #component_results = test_nsa_components()
     #print("Component tests completed successfully!")
-    
+    test_external_nsa()
     # Test full forward pass
     forward_results = test_nsa_forward()
     print("Forward pass test completed successfully!")

@@ -3,3 +3,4 @@ wandb
 pylog124M/
 __pycache__/
 logs/
+native_sparse_attention_pytorch/
