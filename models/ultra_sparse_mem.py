@@ -95,15 +95,23 @@ class UltraSparseMemoryMLP(nn.Module):
             for _ in range(num_cores)
         ])
         
+    def to(self, device_or_dtype):
+        self.C = nn.Parameter(self.C.to(device_or_dtype))
+        self.K_row = nn.Parameter(self.K_row.to(device_or_dtype))
+        self.K_col = nn.Parameter(self.K_col.to(device_or_dtype))
+        self.physical_memories = nn.ParameterList([nn.Parameter(p.to(device_or_dtype)) for p in self.physical_memories])
+        self.virtual_projectors = nn.ParameterList([nn.ParameterList([nn.Parameter(p.to(device_or_dtype)) for p in core]) for core in self.virtual_projectors])
+        return super().to(device_or_dtype)
+        
     @property
     def T(self):
         _, _, T = torch.svd(self.C)
-        return T[:1]
+        return T[:1].to(self.C.device)
     
     @property
     def U(self):
         U, _, _ = torch.svd(self.C)
-        return U[:1]
+        return U[:1].to(self.C.device)
         
     def improved_tucker_decomp(
         self, 
@@ -119,10 +127,8 @@ class UltraSparseMemoryMLP(nn.Module):
         # these are input dependent 
         # NOTE we approximate C as U @ T.T EQ 9        
 
-
         S_col = einsum(self.K_col, Q_col, "r n exp dk_div_r, bs r exp dk_div_r -> bs r exp n") # [r, n, d_k // r] X [..., r, d_k // r] -> [..., r, n]
         S_row = einsum(self.K_row, Q_row, "r n exp dk_div_r, bs r exp dk_div_r -> bs r exp n") # [r, n, d_k // r] X [..., r, d_k // r] -> [..., r, n]
-
         
         # T.T @ S_col shape: [1, r] @ [bs, r, exp, n] -> [bs, exp, n]
         scores_col = einsum(self.T.squeeze(0), S_col, "r, bs r exp n -> bs exp n")  # [bs, exp, n]
@@ -130,7 +136,7 @@ class UltraSparseMemoryMLP(nn.Module):
         
         # Reshape mask_col to match S_col's dimensions
         mask_col = mask_col.unsqueeze(1).expand(-1, self.r, -1, -1)  # [bs, r, exp, n]
-        S_approx_col = mask_col * S_col  # Element-wise multiplication
+        S_col *= mask_col  # Element-wise multiplication
 
         # Similarly for row
         scores_row = einsum(self.U.squeeze(0), S_row, "r, bs r exp n -> bs exp n")  # [bs, exp, n]
@@ -138,22 +144,25 @@ class UltraSparseMemoryMLP(nn.Module):
         
         # Reshape mask_row to match S_row's dimensions
         mask_row = mask_row.unsqueeze(1).expand(-1, self.r, -1, -1)  # [bs, r, exp, n]
-        S_approx_row = mask_row * S_row  # Element-wise multiplication
+        S_row *= mask_row  # Element-wise multiplication
 
+        
         # Compute individual score maps for each core
-        all_scores = []
+        grid = None # sum scores across cores
         for C_i in self.Cs:
             grid_i = einsum(
-                S_approx_row, 
+                S_row, 
                 C_i, 
-                S_approx_col, 
+                S_col, 
                 "bs r exp_i n, r r, bs r exp_j n -> bs exp_i exp_j n"
             )
             grid_i = grid_i.view(grid_i.shape[0], self.virtual_expansion_factor, grid_i.shape[-1])
-            all_scores.append(grid_i)
+            if grid is None:
+                grid = grid_i
+            else:
+                grid += grid_i
         
-        # Sum scores across cores (Equation 16)
-        grid = sum(all_scores)
+        grid = cast(Tensor, grid)
         Scores, Indices = torch.topk(torch.softmax(grid, dim=-1), m, dim=-1)
         return Scores, Indices
 
@@ -174,7 +183,6 @@ class UltraSparseMemoryMLP(nn.Module):
         # Process each core separately
         for core_idx, physical_memory in enumerate(self.physical_memories):
             core_out: Optional[Tensor] = None
-            
             for p in range(self.virtual_expansion_factor):
                 gathered = physical_memory[indices[:, p, :]]
                 vals = values[:, p, :]
@@ -184,7 +192,9 @@ class UltraSparseMemoryMLP(nn.Module):
                     core_out = Non_virtual @ self.virtual_projectors[core_idx][p]
                 else:
                     core_out += Non_virtual @ self.virtual_projectors[core_idx][p]
-            
+                
+
+                
             if out is None:
                 out = core_out
             else:
@@ -196,7 +206,6 @@ class UltraSparseMemoryMLP(nn.Module):
         self,
         Q: Float[Tensor, "b seq_len expansion_factor d_query"],
     ) -> Float[Tensor, "b seq_len d_out"]:
-        
         # Split query into row and column components
         # Each should be [b, seq_len, d_query//2]
         mid = self.d_query // 2
@@ -207,11 +216,8 @@ class UltraSparseMemoryMLP(nn.Module):
         # Each should become [b*seq_len, r, virtual_expansionm, d_query/(2*r)]
         Q_row = Q_row.reshape(-1, self.r, self.virtual_expansion_factor_sqrt, mid // self.r)
         Q_col = Q_col.reshape(-1, self.r, self.virtual_expansion_factor_sqrt, mid // self.r)
-        
         vals, scores = self.improved_tucker_decomp(Q_row, Q_col, self.topk)
-        
         out = self.access_virtual_memory(vals, scores)
-       
         return out
         
     def aux_loss(self) -> Tensor:
@@ -230,24 +236,3 @@ class UltraSparseMemoryMLP(nn.Module):
         return loss
         
 
-
-if __name__ == "__main__":
-    
-    r = 4
-    d_query = 16
-    d_r = d_query // r
-    model = UltraSparseMemoryMLP(
-        d_value=16, 
-        d_query=d_query, 
-        r=r,
-        query_heads=1, 
-        n_experts=32, 
-        topk=10, 
-        virtual_expansion_factor=4
-    )
-    
-    #query = torch.randn(10, 1, 16, 16)
-    #print(model(query).shape)
-    
-    q = torch.randn(2, 10, 2, 16)
-    print(model.forward(q))
