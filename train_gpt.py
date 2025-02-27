@@ -192,6 +192,7 @@ def train(
     train_files: str = "data/fineweb10B/fineweb_train_*.bin",
     val_files: str = "data/fineweb10B/fineweb_val_*.bin",
     # optimization
+    seq_len: int = 64*(1024) if not is_a10g else 16*(1024),
     num_iterations: int = 1393,
     cooldown_frac: float = 0.4,
     # evaluation and logging
@@ -225,7 +226,7 @@ def train(
         num_iterations=num_iterations,
         cooldown_frac=cooldown_frac,
         val_loss_every=val_loss_every,
-        seq_len=64*(1024) if not is_a10g else 16*(1024),  # Default based on is_a10g
+        seq_len=seq_len,  # Default based on is_a10g
         save_checkpoint=save_checkpoint,
         use_liger=use_liger,
         use_adam_mini=use_adam_mini,

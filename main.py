@@ -1,5 +1,6 @@
 from modal_common import volume, image, app, ssh_function_wrapper, maybe_upload_project, train_gpt
 from modal import Secret, gpu
+import argparse
 
 KILL_AFTER = 60 * 60 * 14 # 14 hours
 @app.function(
@@ -17,10 +18,12 @@ def ssh_function():
 
 @app.local_entrypoint()
 def main():
-    maybe_upload_project()
-    ssh_function.remote()
     
-    #train_gpt.remote(
-    #    type='current-best',
-    #    torch_compile=True,
-    #)
+    #print(volume.listdir('data'))
+    maybe_upload_project()
+    #ssh_function.remote()
+    
+    """ train_gpt.remote(
+        type='nsa',
+        #torch_compile=True,
+    ) """

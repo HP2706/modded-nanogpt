@@ -14,3 +14,4 @@ native-sparse-attention-pytorch # https://github.com/lucidrains/native-sparse-at
 local-attention>=1.11.1
 einx>=0.3.0
 einops>=0.8.1
+jaxtyping
