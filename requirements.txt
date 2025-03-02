@@ -11,8 +11,8 @@ tqdm
 hf-transfer
 fire
 native-sparse-attention-pytorch # https://github.com/lucidrains/native-sparse-attention-pytorch
-local-attention>=1.11.1
 einx>=0.3.0
 einops>=0.8.1
 jaxtyping
 matplotlib
+flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git

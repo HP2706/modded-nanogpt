@@ -43,7 +43,8 @@ image = Image.debian_slim(python_version="3.12").apt_install(
         "git config --global user.email \"$GIT_USER_EMAIL\""
     ).run_commands(
         "pip install --pre torch==2.7.0.dev20250110+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade",
-        "pip install -r /root/requirements.txt"
+        "pip install -r /root/requirements.txt",
+        "pip install mamba-ssm[causal-conv1d] --no-build-isolation"
     ).env(
         {
             "HUGGINGFACE_HUB_CACHE": "/root/models/hf"
