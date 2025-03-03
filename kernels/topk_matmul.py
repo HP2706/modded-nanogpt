@@ -200,7 +200,7 @@ def topk_matmul(
     a: torch.Tensor,  # [M, K]
     b: torch.Tensor,  # [K, N]
     k: int,
-) -> torch.LongTensor:  # [M, k]
+) -> tuple[torch.Tensor, torch.LongTensor]:  # [M, k], [M, k]
     M, K = a.shape
     K2, N = b.shape
     assert K == K2, "Inner dimensions must match"

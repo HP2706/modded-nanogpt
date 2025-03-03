@@ -5,7 +5,7 @@ from modal import Image, gpu, Secret, Volume, App
 import sys
 import os
 import inspect
-
+from modal_ssh import ssh_function_wrapper, maybe_upload_project, configure_ssh_image
 
 
 
@@ -14,17 +14,20 @@ app = App(name="gpt2-speedrun")
 volume = Volume.from_name("gpt2-speedrun", create_if_missing=True)
 
 
-    
+cuda_version = "12.4.0"  # should be no greater than host CUDA version
+flavor = "devel"  #  includes full CUDA toolkit
+operating_sys = "ubuntu22.04"
+tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
 #get to root of the project
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-image = Image.debian_slim(python_version="3.12").apt_install(
-    "openssh-server",
-    "git"
-    ).run_commands(
-        "mkdir /run/sshd",
-    ).copy_local_file(
-        os.path.expanduser("~/.ssh/id_rsa.pub"), "/root/.ssh/authorized_keys"
+image = (
+    Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
+    .apt_install("git")
+    .pip_install(  # required to build flash-attn
+        "ninja",
+        "packaging",
+        "wheel",
     ).copy_local_file(
         'requirements.txt',
         '/root/requirements.txt'
@@ -43,105 +46,23 @@ image = Image.debian_slim(python_version="3.12").apt_install(
         "git config --global user.email \"$GIT_USER_EMAIL\""
     ).run_commands(
         "pip install --pre torch==2.7.0.dev20250110+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade",
-        "pip install -r /root/requirements.txt",
-        "pip install mamba-ssm[causal-conv1d] --no-build-isolation"
+        "pip install -r /root/requirements.txt"
     ).env(
         {
             "HUGGINGFACE_HUB_CACHE": "/root/models/hf"
         }
-    )
+    ).run_commands(
+    "pip install git+https://github.com/HP2706/modal-ssh.git"
+)
+)
+
+image = configure_ssh_image(image)
 
 
-def maybe_upload_project():
-    if 'data' in [x.path for x in volume.listdir('')]:
-        dirs = volume.listdir('data')
-        for d in dirs:
-            print("path: ", d.path)
-            end_name = d.path.split('/')[-1]
-            if end_name == 'project' and d.type == FileEntryType.DIRECTORY:
-                print("Project already uploaded")
-                return
-    else:
-        print("no data folder", volume.listdir(''))
-
-    print("Uploading project")
-    
-    with volume.batch_upload(force=True) as uploader:
-        uploader.put_directory(
-            '.',
-            remote_path="data/project"
-        )
-    
-
-
-
-def ssh_function_wrapper():
-    import subprocess
-    import time
-    import modal
-    import signal
-    import torch
-    import gc
-    import os
-    import atexit
-
-    def cleanup_gpu(signum=None, frame=None):
-        try:
-            # Clear CUDA memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                gc.collect()
-            
-            # More graceful process termination
-            os.system('pkill -15 -f python')  # Send SIGTERM first
-            time.sleep(2)  # Give processes time to cleanup
-            current_pid = os.getpid()
-            os.system(f'pkill -9 -f python && kill -9 $(pgrep -f python | grep -v {current_pid})')
-            
-            if torch.cuda.is_available():
-                os.system('nvidia-smi --gpu-reset')
-        except Exception as e:
-            print(f"Cleanup error: {e}")
-
-    # Register cleanup for various signals and exit
-    signal.signal(signal.SIGHUP, cleanup_gpu)
-    signal.signal(signal.SIGTERM, cleanup_gpu)
-    signal.signal(signal.SIGINT, cleanup_gpu)
-    atexit.register(cleanup_gpu)
-
-    # Configure sshd with custom settings
-    sshd_config = """
-    PrintMotd no
-    PrintLastLog no
-    UsePAM no
-    """
-    with open("/etc/ssh/sshd_config.d/custom.conf", "w") as f:
-        f.write(sshd_config)
-
-    try:
-        subprocess.run(["service", "ssh", "restart"], check=True)
-        with modal.forward(port=22, unencrypted=True) as tunnel:
-            hostname, port = tunnel.tcp_socket
-            connection_cmd = f'ssh -p {port} root@{hostname}'
-            print(f"ssh into container using: {connection_cmd}")
-            
-            while True:
-                time.sleep(60)  # Check every minute
-                # Verify SSH daemon is still running
-                try:
-                    subprocess.run(["pgrep", "sshd"], check=True)
-                except subprocess.CalledProcessError:
-                    print("SSH daemon died, restarting...")
-                    subprocess.run(["service", "ssh", "restart"], check=True)
-    except Exception as e:
-        print(f"SSH server error: {e}")
-    finally:
-        cleanup_gpu()
-        volume.commit()
 
 KILL_AFTER = 60 * 60 * 14 # 14 hours
 @app.function(
-    gpu='A10G',
+    gpu='T4',
     image=image, 
     timeout=KILL_AFTER,
     secrets=[Secret.from_name("wandb"), Secret.from_name("HF_SECRET")],
@@ -174,3 +95,5 @@ def train_gpt(**kwargs):
     kwargs_str = ' '.join([f'--{k} {v}' for k, v in kwargs.items()])
     print(f"Running train with: {kwargs_str}")
     os.system(f"torchrun train_gpt.py {kwargs_str}")
+
+
