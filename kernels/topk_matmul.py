@@ -114,6 +114,7 @@ def argsort(
     return x, ids
 
 
+
 @triton.jit
 def topk_matmul_kernel(
     a_ptr,  # Matrix A [M, K]
@@ -164,25 +165,25 @@ def topk_matmul_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
     
-    offs = tl.where(
-        (tl.arange(0, BLOCK_SIZE_N)[:, None] >= 0) & (tl.arange(0, BLOCK_SIZE_M)[None, :] >= 0), 
-        tl.arange(0, BLOCK_SIZE_N), 
-        -1
-    )
     
+    offs = tl.arange(
+        0,
+        BLOCK_SIZE_M*BLOCK_SIZE_N
+    ).reshape(
+        BLOCK_SIZE_M, 
+        BLOCK_SIZE_N
+    ) % BLOCK_SIZE_M 
     sorted_values, sorted_indices = argsort(accumulator, offs, descending=True)
-    
-    # Create base mask for one row
-    base_mask = tl.arange(0, TK) 
-    row_indices = tl.arange(0, BLOCK_SIZE_M) 
     
     # create a mask for the top-k elements
     # this is a workaround to do base_mask.repeat(BLOCK_SIZE_M, 1)
-    repeat_mask = tl.where(
-        (row_indices[:, None] >= 0) & (base_mask[None, :] >= 0), 
-        base_mask, 
-        -1
-    )
+    repeat_mask = tl.arange(
+        0, 
+        BLOCK_SIZE_M*TK
+    ).reshape(
+        BLOCK_SIZE_M, 
+        TK
+    ) % TK
 
     gathered_values = tl.gather(sorted_values, repeat_mask, axis=1)
     gathered_indices = tl.gather(sorted_indices, repeat_mask, axis=1)
