@@ -13,9 +13,10 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
-# torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
+if torch.cuda.is_available():
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+    # torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 
 
 class GPT(nn.Module):
