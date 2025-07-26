@@ -139,41 +139,64 @@ def upsample(
     boundary_mask : Bool[torch.Tensor, 'B L']
 ) -> torch.Tensor:
     '''
-    Upsample the compressed hidden states z to the original sequence length
+    Upsample the compressed hidden states z to the original sequence length using EMA
     
-    Implements equations 8 and 9:
-    - eq 8: z̃_t = z_{∑_{k=1}^t b_k}  (causal expansion)
-    - eq 9: Upsampler(z̃, c)_t = STE(c_t) · z̃_t  (confidence-weighted decompression)
+    Modified to use exponential moving average instead of confidence-weighted lookup
     '''
     B, L_compressed, D = z.shape
-    B, L_original = boundary_mask.shape
+    L_original = boundary_mask.shape[1]
     
-    # Step 1: Compute confidence scores (equation 6 from paper)
-    # c_t = p_t^{b_t} * (1-p_t)^{1-b_t}
-    # This gives high confidence when boundary predictions are correct
-    confidence = (boundary_probs[:, :, 1] ** boundary_mask.float()) * (boundary_probs[:, :, 0] ** (1 - boundary_mask.float()))
-    
-    # Step 2: Apply STE (Straight-Through Estimator) for gradient stabilization
-    confidence_ste = ste_func(confidence)
-    
-    # Step 3: Compute cumulative boundary indices (equation 8)
-    # ∑_{k=1}^t b_k gives the index into the compressed sequence z
+    # Step 1: Compute cumulative boundary indices to map original positions to compressed positions
     cumulative_boundaries = torch.cumsum(boundary_mask.float(), dim=-1)
-    
-    # Clamp to valid indices (boundary_mask should ensure this, but safety first)
     cumulative_boundaries = torch.clamp(cumulative_boundaries - 1, min=0, max=L_compressed - 1).long()
     
-    # Step 4: Expand compressed sequence to original length (equation 8)
-    # z̃_t = z_{∑_{k=1}^t b_k}
+    # Step 2: Extract boundary probabilities for EMA decay
+    # Use the probability of being a boundary (boundary_probs[:, :, 1])
+    p = torch.clamp(boundary_probs[:, :, 1].float(), min=1e-4, max=1 - 1e-4)
+    
+    # Step 3: Get the expanded hidden states using gather (same as original)
     z_expanded = torch.gather(
         z, 
         dim=1, 
         index=cumulative_boundaries.unsqueeze(-1).expand(-1, -1, D)
     )
-
-    # Step 5: Apply confidence weighting (equation 9)
-    # Upsampler(z̃, c)_t = STE(c_t) · z̃_t
-    upsampled = confidence_ste.unsqueeze(-1) * z_expanded
+    
+    # Step 4: Vectorized EMA computation using torch operations
+    # Use torch's built-in operations to compute EMA efficiently
+    
+    # Step 4a: Initialize output tensor
+    upsampled = torch.zeros_like(z_expanded)
+    
+    # Step 4b: First position: no EMA, just use the current value
+    upsampled[:, 0] = z_expanded[:, 0]
+    
+    # Step 4c: Compute (1-p) for decay factors
+    one_minus_p = 1 - p  # (B, L)
+    
+    # Step 4d: Create a mask for lower triangular matrix (causal)
+    causal_mask = torch.tril(torch.ones(L_original, L_original, device=z.device, dtype=z.dtype))
+    
+    # Step 4e: Compute cumulative products efficiently using torch operations
+    # For each position t, we need the product of (1-p) from position 0 to t-1
+    cumprod_one_minus_p = torch.cumprod(one_minus_p, dim=1)  # (B, L)
+    
+    # Step 4f: Pad with 1 at the beginning for proper indexing
+    cumprod_padded = torch.cat([torch.ones(B, 1, device=z.device, dtype=z.dtype), cumprod_one_minus_p[:, :-1]], dim=1)
+    
+    # Step 4g: Create the weight matrix using broadcasting
+    # For each position t: out_t = sum_{i=0}^t [z_i * p_i * prod_{j=i+1}^t (1-p_j)]
+    # W[i,j] = p[j] * cumprod_padded[i] / cumprod_padded[j] if i >= j, else 0
+    
+    # Reshape for broadcasting
+    p_reshaped = p.unsqueeze(1)  # (B, 1, L)
+    cumprod_reshaped = cumprod_padded.unsqueeze(2)  # (B, L, 1)
+    
+    # Create the weight matrix using broadcasting
+    weight_matrix = p_reshaped * (cumprod_reshaped / cumprod_padded.unsqueeze(1)) * causal_mask.unsqueeze(0)
+    
+    # Step 4h: Apply the weight matrix to get EMA
+    # (B, L, L) @ (B, L, D) -> (B, L, D)
+    upsampled = torch.bmm(weight_matrix, z_expanded)
     
     return upsampled
 
