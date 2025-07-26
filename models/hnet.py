@@ -181,6 +181,7 @@ class EncoderOutput(BaseModel):
     hidden_states : Float[torch.Tensor, "B L D"]
     encoder_outputs : List[Float[torch.Tensor, "B L D"]]  # Add encoder outputs for residual connections
     loss : Optional[torch.Tensor] = None
+    next_causal_mask : Bool[torch.Tensor, "B L"]
     
     class Config:
         arbitrary_types_allowed = True
@@ -255,6 +256,7 @@ class Encoder(nn.Module):
         return EncoderOutput(
             hidden_states=hidden_states, 
             encoder_outputs=encoder_outputs,  # Add encoder outputs for residual connections
+            next_causal_mask=next_causal_mask,
         )
         
 
@@ -337,27 +339,36 @@ class TransformerPP(nn.Module):
         model_dim : int,
         num_heads : int,
         num_layers : int,
+        dummy : bool = True,
     ):
         super().__init__()
         
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx, dummy=True) for layer_idx in range(num_layers)])
+        self.dummy = dummy
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx, dummy=dummy) for layer_idx in range(num_layers)])
         # U-net design by @brendanh0gan
         self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+        self.value_embeds = nn.ModuleList([nn.Linear(model_dim, model_dim) for _ in range(num_layers)])
         
     def forward(
         self,
         hidden_states : Float[torch.Tensor, "B L D"],
-        causal_mask : Bool[torch.Tensor, "B L"],
         sliding_window_num_blocks : Int[torch.Tensor, "B"],
     ) -> Float[torch.Tensor, "B L D"]:
         assert hidden_states.ndim == 2, \
             "hidden_states must be 2D (Num_tokens, D_model)"
 
-        long_bm, short_bm = create_block_masks(hidden_states, sliding_window_num_blocks)
-        ve = x0 = x = hidden_states
+        if not self.dummy:
+            long_bm, short_bm = create_block_masks(hidden_states, sliding_window_num_blocks)
+        else:
+            # only used for development
+            long_bm = short_bm = torch.ones(hidden_states.shape[0], dtype=torch.bool, device=hidden_states.device)
+            
+        x0 = x = norm(hidden_states)
+        
+        ve = [ve_embed(x0) for ve_embed in self.value_embeds]
         
         assert len(ve) == len(self.blocks)
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
@@ -366,10 +377,13 @@ class TransformerPP(nn.Module):
         # Store outputs for U-Net skip connections
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
+        block_masks = [long_bm] + [short_bm] * (max(self.num_encoder_layers - 2, 0)) + [long_bm] + [short_bm] 
+        
+        #block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
             skip_connections.append(x)
+        
         # Decoder pass - process the remaining blocks with weighted skip connections
         block_masks.reverse()
         for i in range(self.num_decoder_layers):
@@ -409,12 +423,23 @@ class HNet(nn.Module):
         encoder_output = self.encoder.forward(hidden_states, causal_mask)
         
         # Pass through main model
-        hidden_states = self.main_model(encoder_output.hidden_states, causal_mask, sliding_window_num_blocks)
+        d = encoder_output.hidden_states.shape[-1]
+        
+        hidden_states = self.main_model(
+            encoder_output.hidden_states.view(-1, d), 
+            sliding_window_num_blocks
+        )
+        
+        hidden_states = hidden_states.view(
+            encoder_output.hidden_states.shape[0], 
+            encoder_output.hidden_states.shape[1], 
+            d
+        )
         
         # Pass through decoder with residual connections
         hidden_states = self.decoder.forward(
             hidden_states, 
-            causal_mask, 
+            encoder_output.next_causal_mask, 
             encoder_output.encoder_outputs,  # Pass encoder outputs for residual connections
         )
         

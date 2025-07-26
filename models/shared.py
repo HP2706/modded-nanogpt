@@ -2,6 +2,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 import torch
+from einops import rearrange
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
@@ -84,6 +85,40 @@ class CausalSelfAttention(nn.Module):
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
+    
+class CausalSelfAttentionPlain(nn.Module):
+    def __init__(
+        self, 
+        dim: int, num_heads: int, head_dim: int, layer_idx: int,
+        attn_scale: float = 0.12,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.Q = nn.Linear(dim, head_dim*num_heads)
+        self.K = nn.Linear(dim, head_dim*num_heads)
+        self.V = nn.Linear(dim, head_dim*num_heads)
+        self.O = nn.Linear(head_dim*num_heads, dim)
+        self.attn_scale = attn_scale 
+        
+    def forward(self, x: Tensor, ve: Tensor | None, block_mask: torch.Tensor):
+        x = x.view(1, -1, x.shape[-1]) # add batch dimension
+        q = self.Q(x)
+        k = self.K(x)
+        v = self.V(x)
+        
+        output = F.scaled_dot_product_attention(
+            rearrange(q, "b t (h d) -> b h t d", h=self.num_heads),
+            rearrange(k, "b t (h d) -> b h t d", h=self.num_heads),
+            rearrange(v, "b t (h d) -> b h t d", h=self.num_heads),
+            is_causal=True,
+            dropout_p=0.0,
+            scale=self.attn_scale,
+        )
+
+        y = self.O(rearrange(output, "b h t d -> b t (h d)"))
+
+        return y
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
@@ -100,17 +135,20 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, layer_idx: int, dummy: bool = False):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, num_heads, layer_idx, head_dim=dim//num_heads) if layer_idx != 7 else None
+        if dummy:
+            self.attn = CausalSelfAttentionPlain(dim, num_heads, head_dim=dim//num_heads, layer_idx=layer_idx)
+        else:
+            self.attn = CausalSelfAttention(dim, num_heads, layer_idx, head_dim=dim//num_heads) if layer_idx != 7 else None
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x, ve, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(norm(x), ve, block_mask)
+            x = x + self.attn.forward(norm(x), ve, block_mask)
         x = x + self.mlp(norm(x))
         return x
 
