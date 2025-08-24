@@ -1,0 +1,21 @@
+# MixtureOfExperts model configuration
+defaults:
+  - training
+
+model_cfg:
+  vocab_size: 50257
+  n_ctx: 1024
+  d_model: 768
+  num_heads: 6
+  n_layers: 12
+  num_experts: 8
+  top_k: 2
+  jitter_noise: 0.0
+  alpha: 0.01
+  beta: 0.001
+  gate_type: "mixtral"
+  gate_norm_factor: null
+
+# Override training parameters if needed
+train_seq_len: 1024
+num_iterations: 1750

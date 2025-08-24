@@ -1,0 +1,14 @@
+# Current best GPT model configuration
+defaults:
+  - training
+
+model_cfg:
+  vocab_size: 50257
+  num_layers: 12
+  num_heads: 6
+  model_dim: 768
+  use_fp8: false
+
+# Override training parameters if needed
+train_seq_len: 49152
+num_iterations: 1750

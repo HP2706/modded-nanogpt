@@ -1,0 +1,17 @@
+# NSA model configuration
+defaults:
+  - training
+
+model_cfg:
+  vocab_size: 50257
+  num_layers: 12
+  num_heads: 6
+  model_dim: 768
+  sliding_window_size: 32
+  compress_block_size: 4
+  selection_block_size: 4
+  num_selected_blocks: 4
+
+# Override training parameters if needed
+train_seq_len: 49152
+num_iterations: 1750

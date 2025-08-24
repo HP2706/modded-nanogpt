@@ -1,0 +1,32 @@
+# Mamba model configuration
+defaults:
+  - training
+
+model_cfg:
+  vocab_size: 50257
+  n_ctx: 1024
+  d_model: 768
+  d_state: 16
+  n_layers: 12
+  pad_token_id: 0
+  bos_token_id: 0
+  fused_add_norm: false
+  eos_token_id: 0
+  expand: 2
+  d_conv: 4
+  use_bias: false
+  use_conv_bias: true
+  hidden_act: "silu"
+  initializer_range: 0.1
+  residual_in_fp32: true
+  time_step_rank: "auto"
+  time_step_scale: 1.0
+  time_step_min: 0.001
+  time_step_max: 0.1
+  time_step_init_scheme: "random"
+  time_step_floor: 1e-4
+  rescale_prenorm_residual: false
+
+# Override training parameters if needed
+train_seq_len: 1024
+num_iterations: 1750

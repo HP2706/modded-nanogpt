@@ -1,0 +1,19 @@
+# HNetXNSA model configuration
+defaults:
+  - training
+
+model_cfg:
+  vocab_size: 50257
+  n_ctx: 1024
+  d_model: 768
+  num_heads: 6
+  model_dim: 768
+  n_inner_layers: 6
+  n_compress_decompress_layers: 3
+  compression_decompress_size: 8
+  use_fp8: false
+  dummy: false
+
+# Override training parameters if needed
+train_seq_len: 1024
+num_iterations: 1750

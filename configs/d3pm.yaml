@@ -1,0 +1,23 @@
+# D3PM model configuration
+defaults:
+  - training
+
+model_cfg:
+  vocab_size: 50257
+  n_ctx: 1024
+  d_model: 768
+  num_heads: 6
+  n_layers: 12
+  transition_type: "absorbing"
+  noise_schedule: "cosine"
+  absorbing_state_idx: -1
+  num_timesteps: 1000
+  auxiliary_loss_weight: 0.01
+  sampling_timesteps: 1000
+  gaussian_beta_min: 1e-4
+  gaussian_beta_max: 0.02
+  nearest_neighbors: 5
+
+# Override training parameters if needed
+train_seq_len: 1024
+num_iterations: 1750

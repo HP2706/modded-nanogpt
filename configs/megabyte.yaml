@@ -1,0 +1,22 @@
+# MegaByte model configuration
+defaults:
+  - training
+
+model_cfg:
+  vocab_size: 258
+  n_ctx: 1024
+  patch_size: 16
+  d_local: 512
+  d_global_pre_patch: 64
+  n_layers_d_global: 6
+  n_layers_d_local: 6
+  local_n_heads: 8
+  global_n_heads: 4
+  d_mult: 4
+  is_causal: true
+  pad_id: 257
+  eos_id: 258
+
+# Override training parameters if needed
+train_seq_len: 1024
+num_iterations: 1750

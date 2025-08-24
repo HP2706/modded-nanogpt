@@ -1,0 +1,25 @@
+# RecurrentDepth model configuration
+defaults:
+  - training
+
+model_cfg:
+  vocab_size: 50257
+  n_ctx: 1024
+  d_model: 768
+  num_heads: 6
+  n_layers: 12
+  l_p: 2
+  l_core: 4
+  l_c: 2
+  mean_recurrence: 32
+  lognorm_var: 3.0
+  k_trunc: 8
+  s0_std: 0.02
+  r_max: 64
+  eval_recurrence: 32
+  tie_embeddings: true
+  adapter_mode: "concat"
+
+# Override training parameters if needed
+train_seq_len: 1024
+num_iterations: 1750

@@ -1,0 +1,16 @@
+# MixtureOfDepths model configuration
+defaults:
+  - training
+
+model_cfg:
+  vocab_size: 50257
+  n_ctx: 1024
+  d_model: 768
+  num_heads: 6
+  n_layers: 12
+  capacity: 0.125
+  every_other: false
+
+# Override training parameters if needed
+train_seq_len: 1024
+num_iterations: 1750
