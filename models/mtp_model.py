@@ -10,7 +10,7 @@ if torch.cuda.is_available():
 else:
     lm_head_fp8 = None
 from utils import next_multiple_of_n
-from models.shared import ValueEmbedding, Block, CastedLinear, norm
+from models.components.shared import ValueEmbedding, Block, CastedLinear, norm
 from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 
 
@@ -395,3 +395,101 @@ class MTPGPT(nn.Module):
         return loss
 
             
+"""
+Adapter + Config for trainer integration
+"""
+from typing import Optional, Dict
+from pydantic import BaseModel
+from trainer_registry import (
+    DefaultAdapter,
+    _adam_muon_optimizers,
+)
+
+
+class MTPCfg(BaseModel):
+    vocab_size: int = 50257
+    num_layers: Optional[int] = None
+    num_heads: Optional[int] = None
+    model_dim: Optional[int] = None
+    n_mtp_tokens: Optional[int] = None
+    use_liger: Optional[bool] = None
+    use_deepseek_mtp: Optional[bool] = None
+    proj_fp8: Optional[bool] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class MTPAdapter(DefaultAdapter):
+    Cfg = MTPCfg
+
+    def build(self, args, cfg: Optional[MTPCfg]):
+        cfg = cfg or MTPCfg()
+        use_deepseek_mtp = args.type == "deepseek-mtp" if cfg.use_deepseek_mtp is None else cfg.use_deepseek_mtp
+        model = MTPGPT(
+            vocab_size=cfg.vocab_size,
+            num_layers=cfg.num_layers or args.num_layers,
+            num_heads=cfg.num_heads or args.num_heads,
+            model_dim=cfg.model_dim or args.model_dim,
+            n_mtp_tokens=cfg.n_mtp_tokens or args.n_mtp_tokens,
+            use_liger=cfg.use_liger if cfg.use_liger is not None else args.use_liger,
+            use_deepseek_mtp=use_deepseek_mtp,
+            proj_fp8=cfg.proj_fp8 if cfg.proj_fp8 is not None else args.proj_fp8,
+        ).cuda()
+        return model
+
+    def create_optimizers(self, model, args, *, rank, world_size, device):
+        # Collect parameters accounting for MTP specifics
+        hidden_matrix_params = [
+            p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n
+        ]
+        embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+        scalar_params = [p for p in model.parameters() if p.ndim < 2]
+
+        if isinstance(model.mtp, MTP):
+            head_params = [head.weight for head in model.mtp.heads]
+        else:
+            head_params = [model.mtp.shared_head.weight]
+            hidden_matrix_params.extend(
+                [
+                    p
+                    for n, p in list(model.mtp.blocks.named_parameters())
+                    + list(model.mtp.projs.named_parameters())
+                    if p.ndim >= 2 and "embed" not in n
+                ]
+            )
+
+        optimizer1, optimizer2 = _adam_muon_optimizers(
+            hidden_matrix_params=hidden_matrix_params,
+            embed_params=embed_params,
+            scalar_params=scalar_params,
+            head_params=head_params,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+        )
+
+        def get_lr(step: int):
+            t = 1 - step / args.num_iterations
+            w = min(t / args.cooldown_frac, 1.0)
+            return w * 1.0 + (1 - w) * 0.1
+
+        schedulers = [
+            torch.optim.lr_scheduler.LambdaLR(optimizer1, get_lr),
+            torch.optim.lr_scheduler.LambdaLR(optimizer2, get_lr),
+        ]
+        return [optimizer1, optimizer2], schedulers
+
+    def train_step(self, model, inputs, targets, sw_num_blks, *, loss_scale, args):
+        loss, loss_dict = model.forward(inputs, targets, sw_num_blks, with_backward=True)
+        return loss, loss_dict
+
+    def val_step(self, model, inputs, targets, sw_num_blks, *, args):
+        _, loss_dict = model.forward(inputs, targets, sw_num_blks, with_backward=False)
+        return loss_dict["loss_orig"]
+
+    def requires_scaled_grad_on_reduce(self) -> bool:
+        return True
+
+    def post_optimizer_step(self, model: nn.Module, *, args) -> None:
+        pass

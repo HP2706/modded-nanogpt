@@ -6,7 +6,7 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from ops import lm_head_fp8
 from utils import next_multiple_of_n
-from models.shared import ValueEmbedding, Block, CausalSelfAttention, MLP, CastedLinear, norm, create_block_masks
+from models.components.shared import ValueEmbedding, Block, CausalSelfAttention, MLP, CastedLinear, norm, create_block_masks
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -74,3 +74,81 @@ class GPT(nn.Module):
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
         return loss
+
+# ---- Adapter + Config for trainer integration ----
+from typing import Optional, Any, Tuple, Dict
+from pydantic import BaseModel
+from trainer_registry import (
+    DefaultAdapter,
+    _default_group_params_for_gpt_like,
+    _adam_muon_optimizers,
+    _maybe_adam_mini,
+)
+
+
+class CurrentBestCfg(BaseModel):
+    vocab_size: int = 50257
+    num_layers: Optional[int] = None
+    num_heads: Optional[int] = None
+    model_dim: Optional[int] = None
+    use_fp8: bool = False
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class CurrentBestAdapter(DefaultAdapter):
+    Cfg = CurrentBestCfg
+
+    def build(self, args, cfg: Optional[CurrentBestCfg]):
+        cfg = cfg or CurrentBestCfg()
+        model = GPT(
+            vocab_size=cfg.vocab_size,
+            num_layers=cfg.num_layers or args.num_layers,
+            num_heads=cfg.num_heads or args.num_heads,
+            model_dim=cfg.model_dim or args.model_dim,
+            use_fp8=cfg.use_fp8 or args.proj_fp8,
+        ).cuda()
+        return model
+
+    def create_optimizers(self, model, args, *, rank, world_size, device):
+        maybe = _maybe_adam_mini(model, args=args)
+        if maybe is not None:
+            scheds = [torch.optim.lr_scheduler.LambdaLR(maybe[0], lambda _: 1.0)]
+            return maybe, scheds
+
+        hidden_matrix_params, embed_params, scalar_params, head_params = _default_group_params_for_gpt_like(model)
+        optimizer1, optimizer2 = _adam_muon_optimizers(
+            hidden_matrix_params=hidden_matrix_params,
+            embed_params=embed_params,
+            scalar_params=scalar_params,
+            head_params=head_params,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+        )
+
+        def get_lr(step: int):
+            t = 1 - step / args.num_iterations
+            w = min(t / args.cooldown_frac, 1.0)
+            return w * 1.0 + (1 - w) * 0.1
+
+        schedulers = [
+            torch.optim.lr_scheduler.LambdaLR(optimizer1, get_lr),
+            torch.optim.lr_scheduler.LambdaLR(optimizer2, get_lr),
+        ]
+        return [optimizer1, optimizer2], schedulers
+
+    def train_step(self, model, inputs, targets, sw_num_blks, *, loss_scale, args):
+        loss = model.forward(inputs, targets, sw_num_blks)
+        (loss_scale * loss).backward()
+        return loss, {}
+
+    def val_step(self, model, inputs, targets, sw_num_blks, *, args):
+        return model.forward(inputs, targets, sw_num_blks)
+
+    def requires_scaled_grad_on_reduce(self) -> bool:
+        return False
+
+    def post_optimizer_step(self, model: nn.Module, *, args) -> None:
+        pass

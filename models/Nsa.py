@@ -12,7 +12,7 @@ from utils import next_multiple_of_n, round_down_multiple, round_up_multiple
 from native_sparse_attention_pytorch import SparseAttention
 from native_sparse_attention_pytorch.native_sparse_attention import create_fine_mask, interpolate_1d, max_neg_value, pad_at_dim, straight_through, attend
 from ops import lm_head_fp8
-from models.shared import ValueEmbedding, norm, CastedLinear, MLP, create_block_masks, Rotary
+from models.components.shared import ValueEmbedding, norm, CastedLinear, MLP, create_block_masks, Rotary
 from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_block_mask
 from typing import Callable
 
@@ -627,3 +627,81 @@ class NSA_GPT(nn.Module):
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
         return loss
+
+# ---- Adapter + Config for trainer integration ----
+from typing import Optional
+from pydantic import BaseModel
+from trainer_registry import (
+    ModelAdapter,
+    _default_group_params_for_gpt_like,
+    _adam_muon_optimizers,
+)
+
+
+class NSACfg(BaseModel):
+    vocab_size: int = 50257
+    num_layers: Optional[int] = None
+    num_heads: Optional[int] = None
+    model_dim: Optional[int] = None
+    sliding_window_size: Optional[int] = None
+    compress_block_size: Optional[int] = None
+    selection_block_size: Optional[int] = None
+    num_selected_blocks: Optional[int] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class NSAAdapter(ModelAdapter):
+    Cfg = NSACfg
+
+    def build(self, args, cfg: Optional[NSACfg]):
+        cfg = cfg or NSACfg()
+        model = NSA_GPT(
+            vocab_size=cfg.vocab_size,
+            num_layers=cfg.num_layers or args.num_layers,
+            num_heads=cfg.num_heads or args.num_heads,
+            model_dim=cfg.model_dim or args.model_dim,
+            sliding_window_size=cfg.sliding_window_size or args.sliding_window_size,
+            compress_block_size=cfg.compress_block_size or args.compress_block_size,
+            selection_block_size=cfg.selection_block_size or args.selection_block_size,
+            num_selected_blocks=cfg.num_selected_blocks or args.num_selected_blocks,
+        ).cuda()
+        return model
+
+    def create_optimizers(self, model, args, *, rank, world_size, device):
+        hidden_matrix_params, embed_params, scalar_params, head_params = _default_group_params_for_gpt_like(model)
+        optimizer1, optimizer2 = _adam_muon_optimizers(
+            hidden_matrix_params=hidden_matrix_params,
+            embed_params=embed_params,
+            scalar_params=scalar_params,
+            head_params=head_params,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+        )
+
+        def get_lr(step: int):
+            t = 1 - step / args.num_iterations
+            w = min(t / args.cooldown_frac, 1.0)
+            return w * 1.0 + (1 - w) * 0.1
+
+        schedulers = [
+            torch.optim.lr_scheduler.LambdaLR(optimizer1, get_lr),
+            torch.optim.lr_scheduler.LambdaLR(optimizer2, get_lr),
+        ]
+        return [optimizer1, optimizer2], schedulers
+
+    def train_step(self, model, inputs, targets, sw_num_blks, *, loss_scale, args):
+        loss = model.forward(inputs, targets, sw_num_blks)
+        (loss_scale * loss).backward()
+        return loss, {}
+
+    def val_step(self, model, inputs, targets, sw_num_blks, *, args):
+        return model.forward(inputs, targets, sw_num_blks)
+
+    def requires_scaled_grad_on_reduce(self) -> bool:
+        return False
+
+    def post_optimizer_step(self, model: nn.Module, *, args) -> None:
+        pass

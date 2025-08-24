@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import einops
 import math
-from models.shared import CausalSelfAttention, CausalSelfAttentionPlain, MLP, norm, Block, CastedLinear, ValueEmbedding, create_block_masks
+from models.components.shared import CausalSelfAttention, CausalSelfAttentionPlain, MLP, norm, Block, CastedLinear, ValueEmbedding, create_block_masks
 from ops import lm_head_fp8
 from utils import next_multiple_of_n
 from typing import Literal

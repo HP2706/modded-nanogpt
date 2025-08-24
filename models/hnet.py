@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from jaxtyping import Float, Int, Bool
 import math
-from models.shared import Block, norm
+from models.components.shared import Block, norm
 from models.Current_best_gpt import create_block_masks
 
 # https://github.com/state-spaces/mamba/releases/tag/v2.2.5 get wheels
@@ -133,6 +133,56 @@ class STE(torch.autograd.Function):
 def ste_func(x : torch.Tensor) -> torch.Tensor:
     return STE.apply(x)
 
+def causal_conv(
+    x: Float[torch.Tensor, 'B L D'],
+    p: Float[torch.Tensor, 'B L'],
+) -> Float[torch.Tensor, 'B L D']:
+    '''
+    Apply causal exponential moving average convolution
+    
+    Args:
+        x: Input tensor of shape (B, L, D)
+        p: Boundary probabilities of shape (B, L) - higher p means more weight on current token
+    
+    Returns:
+        Tensor of same shape as x with EMA applied
+    '''
+    B, L, D = x.shape
+    
+    # Clamp probabilities to avoid numerical issues
+    p = torch.clamp(p, min=1e-4, max=1 - 1e-4)
+    
+    # Compute (1-p) for decay factors
+    one_minus_p = 1 - p  # (B, L)
+    
+    # Create causal mask (lower triangular matrix)
+    causal_mask = torch.tril(torch.ones(L, L, device=x.device, dtype=x.dtype))
+    
+    # Compute cumulative products for EMA weights
+    # For each position t, we need the product of (1-p) from position 0 to t-1
+    cumprod_one_minus_p = torch.cumprod(one_minus_p, dim=1)  # (B, L)
+    
+    # Pad with 1 at the beginning for proper indexing
+    cumprod_padded = torch.cat([torch.ones(B, 1, device=x.device, dtype=x.dtype), cumprod_one_minus_p[:, :-1]], dim=1)
+    
+    # Create the weight matrix using broadcasting
+    # For each position t: out_t = sum_{i=0}^t [x_i * p_i * prod_{j=i+1}^t (1-p_j)]
+    # W[i,j] = p[j] * cumprod_padded[i] / cumprod_padded[j] if i >= j, else 0
+    
+    # Reshape for broadcasting
+    p_reshaped = p.unsqueeze(1)  # (B, 1, L)
+    cumprod_reshaped = cumprod_padded.unsqueeze(2)  # (B, L, 1)
+    
+    # Create the weight matrix using broadcasting
+    weight_matrix = p_reshaped * (cumprod_reshaped / cumprod_padded.unsqueeze(1)) * causal_mask.unsqueeze(0)
+    
+    # Apply the weight matrix to get EMA
+    # (B, L, L) @ (B, L, D) -> (B, L, D)
+    result = torch.bmm(weight_matrix.to(dtype=x.dtype), x)
+    
+    return result
+
+
 def upsample(
     z : Float[torch.Tensor, 'B L D'],
     boundary_probs : Float[torch.Tensor, 'B L 2'],
@@ -161,42 +211,8 @@ def upsample(
         index=cumulative_boundaries.unsqueeze(-1).expand(-1, -1, D)
     )
     
-    # Step 4: Vectorized EMA computation using torch operations
-    # Use torch's built-in operations to compute EMA efficiently
-    
-    # Step 4a: Initialize output tensor
-    upsampled = torch.zeros_like(z_expanded)
-    
-    # Step 4b: First position: no EMA, just use the current value
-    upsampled[:, 0] = z_expanded[:, 0]
-    
-    # Step 4c: Compute (1-p) for decay factors
-    one_minus_p = 1 - p  # (B, L)
-    
-    # Step 4d: Create a mask for lower triangular matrix (causal)
-    causal_mask = torch.tril(torch.ones(L_original, L_original, device=z.device, dtype=z.dtype))
-    
-    # Step 4e: Compute cumulative products efficiently using torch operations
-    # For each position t, we need the product of (1-p) from position 0 to t-1
-    cumprod_one_minus_p = torch.cumprod(one_minus_p, dim=1)  # (B, L)
-    
-    # Step 4f: Pad with 1 at the beginning for proper indexing
-    cumprod_padded = torch.cat([torch.ones(B, 1, device=z.device, dtype=z.dtype), cumprod_one_minus_p[:, :-1]], dim=1)
-    
-    # Step 4g: Create the weight matrix using broadcasting
-    # For each position t: out_t = sum_{i=0}^t [z_i * p_i * prod_{j=i+1}^t (1-p_j)]
-    # W[i,j] = p[j] * cumprod_padded[i] / cumprod_padded[j] if i >= j, else 0
-    
-    # Reshape for broadcasting
-    p_reshaped = p.unsqueeze(1)  # (B, 1, L)
-    cumprod_reshaped = cumprod_padded.unsqueeze(2)  # (B, L, 1)
-    
-    # Create the weight matrix using broadcasting
-    weight_matrix = p_reshaped * (cumprod_reshaped / cumprod_padded.unsqueeze(1)) * causal_mask.unsqueeze(0)
-    
-    # Step 4h: Apply the weight matrix to get EMA
-    # (B, L, L) @ (B, L, D) -> (B, L, D)
-    upsampled = torch.bmm(weight_matrix, z_expanded)
+    # Step 4: Apply causal EMA convolution
+    upsampled = causal_conv(z_expanded, p)
     
     return upsampled
 
