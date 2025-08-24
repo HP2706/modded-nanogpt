@@ -6,7 +6,7 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 from torch.nn.attention.flex_attention import create_block_mask
-from models.shared import CausalSelfAttention
+from models.components.shared import CausalSelfAttention
 from torch.nn.attention.flex_attention import flex_attention
 from models.Nsa import NSA_Attention
 

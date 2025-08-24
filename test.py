@@ -1,209 +1,183 @@
+from dataclasses import dataclass
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from models.Nsa import NSA_Attention
-from einops import repeat, rearrange
-from torch.nn.attention.flex_attention import create_block_mask
+#from models.hnet import HNet, Encoder, Decoder
+from models.components.mta import MTA
+from models.hnet_x_nsa import CompressBlock, CompressMLP, HNetXNSA
+#from models.hnet_ref.modules.dc import DeChunkState
+from models.hnet import causal_conv
+from torch import nn
 
-# Setup a small test for NSA compressed attention and fine attention
+@dataclass
+class DeChunkState:
+    """
+    The state of the dechunk.
 
-def test_nsa_components():
-    # Parameters
-    batch_size = 1
-    seq_len = 1024
-    model_dim = 768
-    num_heads = 12
-    head_dim = model_dim // num_heads
-    
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    
-    # Create NSA_Attention module
-    attn = NSA_Attention(
-        dim=model_dim,
-        dim_head=head_dim,
-        heads=num_heads,
-        layer_idx=0,
-        sliding_window_size=32,
-        compress_block_size=4,
-        selection_block_size=4,
-        num_selected_blocks=4,
-        query_heads_share_selected_kv=True
-    ).to(device)
-    
-    # Create random input tensors
-    x = torch.randn(batch_size, seq_len, model_dim).to(device)
-    
-    # Process input to get q, k, v
-    B, T = x.size(0), x.size(1)
-    proj = F.linear(x, attn.qkv_w.flatten(end_dim=1).type_as(x))
-    print(f"proj shape: {proj.shape}")
-    q, k, v = proj.view(B, 3 * attn.num_heads, T , attn.head_dim).chunk(3, dim=1)
+    Contains
+        - [last_value] (batch_size, d_model) tensor. The last value of the batch element (used for the EMA).
+    """
 
-    
-    # Setup for compressed attention
-    compress_divisible_seq_len = (T // attn.compress_block_size) * attn.compress_block_size
-    num_compress_blocks = compress_divisible_seq_len // attn.compress_block_size
-    
-    # Setup for fine attention
-    fine_divisible_seq_len = ((T + attn.selection_block_size - 1) // attn.selection_block_size) * attn.selection_block_size
-    num_fine_blocks = fine_divisible_seq_len // attn.selection_block_size
-    
-    # Get memory components
-    mem_ck, mem_cv = repeat(attn.compress_mem_kv, 'kv ... -> kv b ...', b=B)
-    num_mem_compress_kv = mem_ck.shape[-2]
-    
-    # Step 1: Run compressed attention
-    print("Running compressed attention...")
-    compressed_attn_out, csim = attn.compressed_attention(
-        q=q,
-        k=k,
-        v=v,
-        mem_ck=mem_ck,
-        mem_cv=mem_cv,
-        num_mem_compress_kv=num_mem_compress_kv,
-        num_compress_blocks=num_compress_blocks,
-        compress_divisible_seq_len=compress_divisible_seq_len,
-        device=x.device
-    )
-    print(f"Compressed attention output shape: {compressed_attn_out.shape}")
-    print(f"Compressed similarity matrix shape: {csim.shape}")
-    
+    last_value: torch.Tensor  # (batch_size, d_model)
 
-    # Step 2: Apply rotary embeddings for fine attention
-    q_rotary, k_rotary = attn.rotary(q), attn.rotary(k)
-    
-    # Run fine attention
-    print("Running fine attention...")
-    fine_attn_out = attn.fine_attention(
-        fq=q_rotary,
-        fk=k_rotary,
-        fv=v,
-        csim=csim,
-        num_mem_compress_kv=num_mem_compress_kv,
-        num_compress_blocks=num_compress_blocks,
-        num_fine_blocks=num_fine_blocks,
-        fine_divisible_seq_len=fine_divisible_seq_len,
-        device=x.device
-    )
-    print(f"Fine attention output shape: {fine_attn_out.shape}")
-    
-    # Combine the outputs (just for demonstration)
-    print("Combining outputs...")
-    combined_output = 0.5 * compressed_attn_out + 0.5 * fine_attn_out
-    combined_output = attn.merge_heads(combined_output)
-    print(f"Combined output shape: {combined_output.shape}")
-    
-    return {
-        "compressed_output": compressed_attn_out,
-        "fine_output": fine_attn_out,
-        "combined_output": combined_output
-    }
+class DeChunkLayer(nn.Module):
 
-def test_nsa_forward():
-    """Test the full NSA_Attention forward pass"""
-    # Parameters
-    batch_size = 1
-    seq_len = 1024
-    model_dim = 768
-    num_heads = 12
-    head_dim = model_dim // num_heads
-    sliding_window_size = 32
-    
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    
-    # Create NSA_Attention module
-    attn = NSA_Attention(
-        dim=model_dim,
-        dim_head=head_dim,
-        heads=num_heads,
-        layer_idx=0,
-        sliding_window_size=sliding_window_size,
-        compress_block_size=16,
-        selection_block_size=16,
-        num_selected_blocks=16,
-        query_heads_share_selected_kv=True,
-        use_fine_flex_attention=False,
-        use_triton_kernel=True,
-        use_diff_topk=True
-    ).to(device)
-    
-    # Create random input tensors
-    x = torch.randn(batch_size, seq_len, model_dim).to(device)
-    
-    # Create a value embedding (can be None for testing)
-    ve = None
-    
-    # Create a sliding window block mask for attention
-    def sliding_window_mask_fn(b_idx, h_idx, q_idx, kv_idx):
-        # Simple sliding window mask
-        return abs(q_idx - kv_idx) <= sliding_window_size
-    
-    if torch.cuda.is_available():
-        block_mask = create_block_mask(
-            sliding_window_mask_fn, 
-            B=batch_size, 
-            H=num_heads, 
-            Q_LEN=seq_len, 
-            KV_LEN=seq_len, 
-            _compile=True
+    def __init__(
+        self,
+        d_model,
+        dtype=torch.bfloat16,
+        block_size=256,
+        headdim=32,
+    ):
+        super().__init__()
+        self.d_model = d_model
+
+        # Just for Mamba2 kernel.
+        self.dtype = dtype
+        self.block_size = block_size
+        self.headdim = headdim
+        assert d_model % self.headdim == 0
+        self.nheads = d_model // self.headdim
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, device, dtype=None):
+        return DeChunkState(
+            last_value=torch.zeros(
+                batch_size, self.d_model, device=device, dtype=dtype
+            ),
         )
-    else:
-        block_mask = None
-    
-    # Run the full forward pass
-    print("\nTesting full NSA_Attention forward pass...")
-    output = attn.forward(x, ve, block_mask)
-    
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {output.shape}")
-    
-    # Verify output shape matches input shape
-    assert output.shape == x.shape, f"Output shape {output.shape} doesn't match input shape {x.shape}"
-    
-    return {
-        "input": x,
-        "output": output
-    }
+
+    def forward(
+        self,
+        hidden_states,
+        boundary_mask,
+        boundary_prob,
+        cu_seqlens=None,
+        inference_params=None,
+        mask=None,
+    ):
+        if inference_params is None:
+            assert (
+                mask is not None
+            ), "Mask must be provided if inference_params is not provided"
+            assert boundary_mask[
+                :, 0
+            ].all(), "First token must be a boundary if running prefill"
+
+        p = torch.clamp(boundary_prob[..., -1].float(), min=1e-4, max=1 - (1e-4))
+
+        if cu_seqlens is not None:
+            p = p[boundary_mask].unsqueeze(0)
+            seq_idx = get_seq_idx(cu_seqlens, device=hidden_states.device)
+        else:
+            B, L = boundary_mask.shape
+            seq_idx = None
+
+            token_idx = (
+                torch.arange(L, device=hidden_states.device)[None, :]
+                + (~boundary_mask).long() * L
+            )
+            seq_sorted_indices = torch.argsort(token_idx, dim=1)
+
+            p = torch.gather(
+                p, dim=1, index=seq_sorted_indices[:, : hidden_states.shape[1]]
+            )  # (B, M)
+
+        original_dtype = hidden_states.dtype
+        # Reuse Mamba2 kernel for EMA Deaggregator.
+        dt = torch.log(1 / (1 - p)).to(self.dtype)
+        x = (hidden_states / dt[..., None]).to(self.dtype)
+        A = -torch.ones(
+            (self.nheads,), device=hidden_states.device, dtype=torch.float32
+        )
+        b = p.to(self.dtype)
+        c = torch.ones_like(b)
+
+        out = causal_conv(x, p)
+        print(out.shape)
+
+        if cu_seqlens is not None:
+            out = out.squeeze(0)
+            plug_back_idx = boundary_mask.cumsum(dim=0) - 1
+            out = torch.gather(
+                out, dim=0, index=plug_back_idx.unsqueeze(-1).expand(-1, self.d_model)
+            )
+        else:
+            plug_back_idx = torch.cumsum(boundary_mask, dim=1) - 1  # (B, L)
+            out = torch.gather(
+                out,
+                dim=1,
+                index=plug_back_idx.unsqueeze(-1).expand(-1, -1, self.d_model),
+            )
+
+        if inference_params is not None:
+            inference_params.last_value.copy_(out[:, -1])
+
+        return out.to(original_dtype)
+
+    def step(self, hidden_states, boundary_mask, boundary_prob, inference_params):
+        # hidden_states is (B', 1, D), where B' = boundary_mask.sum()
+        # boundary_mask is (B,) and boundary_prob is (B, 2)
+
+        B = boundary_mask.shape[0]
+        # B_selected = hidden_states.shape[0]
+        D = hidden_states.shape[-1]
+
+        p = torch.zeros(B, device=hidden_states.device, dtype=hidden_states.dtype)
+        p[boundary_mask] = boundary_prob[boundary_mask, -1].clamp(
+            min=1e-4, max=1 - (1e-4)
+        )
+
+        current_hidden_states = torch.zeros(
+            B, D, device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        current_hidden_states[boundary_mask] = hidden_states.squeeze(1)
+
+        result = p * current_hidden_states + (1 - p) * inference_params.last_value
+        inference_params.last_value.copy_(result)
+
+        return result.unsqueeze(1)
 
 
-def test_external_nsa():
-    from native_sparse_attention_pytorch.native_sparse_attention import SparseAttention
-    import torch
-
-    attn = SparseAttention(
-        dim=768,
-        dim_head=768 // 12,
-        heads=12,
-        sliding_window_size=32,
-        compress_block_size=16,
-        num_selected_blocks=16,
-        selection_block_size=16,
-        num_compressed_mem_kv=1,
-        query_heads_share_selected_kv=True,
-        use_triton_kernel=True,
-        use_diff_topk=True,
-    )
-
-    device = torch.device("cuda")
-    inp = torch.randn(1, 1024, 768).to(device)
-    attn.to(device)
-    attn.forward(inp)
 
 if __name__ == "__main__":
-    # Test individual components
-    #component_results = test_nsa_components()
-    #print("Component tests completed successfully!")
-    test_external_nsa()
-    # Test full forward pass
-    forward_results = test_nsa_forward()
-    print("Forward pass test completed successfully!")
+    """ model = HNetXNSA(
+        vocab_size = 16,
+        num_heads = 1,
+        model_dim = 64,
+        n_inner_layers = 1,
+        n_compress_decompress_layers = 2,
+        compression_decompress_size = 16,
+        use_fp8 = False,
+        dummy = True,
+    )
+    
+    input_seq = torch.randint(0, 16, (1, 256))
+    target_seq = torch.randint(0, 16, (1, 256))
+    sliding_window_num_blocks = torch.ones(1, 100)
+    
+    print("input_seq", input_seq.shape)
+    model.forward(
+        input_seq = input_seq,
+        target_seq = target_seq,
+        sliding_window_num_blocks = sliding_window_num_blocks,
+    )
+     """
+     
+     
+
+    # sample probability
+    boundary_prob_single = torch.rand(1, 100)
+    boundary_probs = torch.stack([boundary_prob_single, 1 - boundary_prob_single], dim = -1)
+    
+    boundary_mask = boundary_probs[:, :, 0] > 0.5
+    hidden_states = torch.randn(1, 100, 64)
+    
+    dechunk_layer = DeChunkLayer(
+        d_model = 64,
+        dtype = torch.bfloat16,
+        block_size = 256,
+        headdim = 32,
+    )
+    
+    mask = torch.ones(1, 100)
+    
+    o = dechunk_layer.forward(hidden_states, boundary_mask, boundary_probs, mask = mask)
+    print(o.shape)

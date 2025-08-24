@@ -5,9 +5,9 @@ import torch
 import time
 import matplotlib.pyplot as plt
 import numpy as np
-from models.ultra_sparse_mem import UltraSparseMemoryMLP
-from models.memory_at_scale import MemoryAtScaleMLP
-from models.peerlayer import PeerLayer
+from models.components.ultra_sparse_mem import UltraSparseMemoryMLP
+from models.components.memory_at_scale import MemoryAtScaleMLP
+from models.components.peerlayer import PeerLayer
 import gc
 from torch.cuda import max_memory_allocated, reset_peak_memory_stats
 
