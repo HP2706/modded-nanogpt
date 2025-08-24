@@ -186,8 +186,6 @@ class MuonFp8(_MuonBase):
     def _subclass_zeros(numel: int, signed: bool, block_size: int):
         return OptimStateFp8.zeros((numel,), block_size, device=None)
 
-
-
 #TODO check _MuonBase is implemented correctly like this reference implementation
 class Muon(torch.optim.Optimizer): 
     """
@@ -278,3 +276,134 @@ class Muon(torch.optim.Optimizer):
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
+
+
+
+
+class _MuonClipBase(Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+    Base class for Muon optimizers with pluggable state dtype.
+    Subclasses must implement _subclass_zeros to allocate the update buffer.
+    
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Muon Clip modifies the Muon optimizer in the following ways:
+    
+    for each layer, we find the max attention head logit called S_head_max if this value is above tau
+    we scale the query_head and key_head  projection matrices in the following way:
+    
+    coeff = min(1, tau/s_head_max)
+    query_head = sqrt(coeff) * query_head
+    key_head = sqrt(coeff) * key_head
+    
+    note this is done per head, as different attention heads have different max logit values
+    #NOTE IMPORTANT: this optimizer only works for MHA not MLA
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iteration steps to use.
+    """
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+        rank=0,
+        world_size=1,
+        device=None,
+        *,
+        block_size=128,
+        layer_pattern = r'layer' # used to parse the layers
+    ):
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.block_size = block_size
+        self.scale_rms = 0.2
+        
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+        )
+        # group parameters by flat size for sharded updates
+        sizes = {p.numel() for p in params}
+        param_groups = []
+        for size in sizes:
+            group_params = [p for p in params if p.numel() == size]
+            # allocate update buffer of length world_size × size
+
+            buf = self._subclass_zeros(self.world_size * size, signed=False, block_size=self.block_size)
+            views = [buf[i] for i in range(self.world_size)]
+            param_groups.append({
+                "params": group_params,
+                "update_buffer": buf,
+                "update_buffer_views": views,
+            })
+        super().__init__(param_groups, defaults)
+        
+        for 
+
+    @staticmethod
+    def _subclass_zeros(numel: int, signed: bool, block_size: int):
+        """
+        Allocate an empty optimizer state buffer of `numel` elements,
+        quantized according to subclass implementation.
+        """
+        raise NotImplementedError
+
+    @torch.no_grad()
+    def step(self):
+        """
+        Core Muon update: gathers per-shard updates, applies orthogonalization,
+        and updates parameters. Subclasses share this logic.
+        """
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            update_buffer = group["update_buffer"]
+            update_views = group["update_buffer_views"]
+            params = group["params"]
+            handle = None
+            params_world = None
+
+            def update_prev():
+                if params_world is None or handle is None:
+                    return
+                handle.wait()
+                for p_world, g_world in zip(params_world, update_views):
+                    p_world.add_(g_world.view_as(p_world),
+                                 alpha=-lr * max(p_world.size(-2) / p_world.size(-1))**0.5) 
+
+            for base_i in range(0, len(params), self.world_size):
+                if base_i + self.rank < len(params):
+                    p = params[base_i + self.rank]
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.lerp_(g, 1 - momentum)
+                    g = g.lerp(buf, momentum) if nesterov else buf
+                    g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+                else:
+                    g = update_views[self.rank]
+
+                update_prev()
+                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
+                params_world = params[base_i:base_i + self.world_size]
+
+            update_prev()
+            
