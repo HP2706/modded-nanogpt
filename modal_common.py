@@ -28,9 +28,10 @@ image = (
         "ninja",
         "packaging",
         "wheel",
-    ).copy_local_file(
+    ).add_local_file(
         'requirements.txt',
-        '/root/requirements.txt'
+        '/root/requirements.txt',
+        copy=True
     ).pip_install(
         "uv",
     ).env(
