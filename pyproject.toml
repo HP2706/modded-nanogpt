@@ -1,0 +1,13 @@
+[project]
+requires-python = ">=3.11"
+name = "dummy"
+version = "0.1.0"
+
+license = { file = "LICENSE" }
+
+
+[project.scripts]
+convert_pdf = "convert_pdf_cli:main"
+
+[tool.setuptools]
+py-modules = ["convert_pdf_cli"]

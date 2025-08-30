@@ -7,3 +7,5 @@ native_sparse_attention_pytorch/
 
 models/hnet_ref/*
 test.py
+outputs/
+papers/
