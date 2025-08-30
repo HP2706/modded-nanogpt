@@ -1,6 +1,7 @@
 import inspect
 from typing import Literal
-import fire
+import hydra
+from omegaconf import DictConfig, OmegaConf
 import wandb
 import datetime
 from tqdm import tqdm
@@ -93,58 +94,35 @@ dist.barrier()
 print(f"Rank: {rank}, World size: {world_size}")
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
-@dataclass
-class TrainConfig:
-    # optimization
-    num_iterations: int
-    cooldown_frac: float
-    # evaluation and logging
-    val_loss_every: int
-    # implementation
-    seq_len: int
-    save_checkpoint: bool
-    use_liger: bool
-    use_adam_mini: bool
-    num_layers: int
-    n_mtp_tokens: Optional[int]
-    model_dim: int
-    use_wandb: bool
-    torch_compile: bool
-    use_deepseek_mtp: bool
-    proj_fp8: bool
-    bfloat16: bool
-    BLOCK_SIZE: int
-    IS_MODAL: bool
-    type: Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best', 'nsa', 'gpt2', 'sedd']
-    sliding_window_size: Optional[int]
-    num_selected_blocks: Optional[int]
-    compress_block_size: Optional[int]
-    selection_block_size: Optional[int]
-    # adapter + model config
-    model_adapter: Optional[str] = None  # optional dynamic adapter path
-    model_cfg: Optional[object] = None   # dict or pydantic BaseModel
-    # data
-    train_files: str = "data/fineweb10B/fineweb_train_*.bin"  # input .bin to train on
-    val_files: str = "data/fineweb10B/fineweb_val_*.bin"  # input .bin to eval validation loss on
-
-    def __post_init__(self):
-        # Set values that depend on is_a10g
-        self.num_heads = 6 if not is_a10g else 1  # NOTE there will be bugs if this is not 1 when model_dim != 768
-        if self.type in ['deepseek-mtp', 'base-mtp']:
-            assert self.n_mtp_tokens is not None, "n_mtp_tokens must be specified for deepseek-mtp or base-mtp"
-            # First ensure base seq_len is multiple of 128
-            self.seq_len = next_multiple_of_n(self.seq_len, n=128)
-            # Then add the n_tokens
-            self.seq_len = self.seq_len + self.n_mtp_tokens
-        
-        self.batch_size = world_size * self.seq_len
-        self.val_tokens = 10485760 if not is_a10g else 16*self.seq_len
-        self.gradient_accumulation_steps = math.ceil(8 / world_size)
-        self.effective_batch_size = self.batch_size * self.gradient_accumulation_steps
+def create_config_from_hydra(cfg: DictConfig):
+    """Convert Hydra DictConfig to a simple namespace object with post-processing."""
+    # Create a simple object to hold config values
+    config = type('Config', (), {})()
+    
+    # Copy all config values (Hydra defaults merge everything into one flat structure)
+    for key, value in cfg.items():
+        setattr(config, key, value)
+    
+    # Post-processing logic (equivalent to __post_init__)
+    config.num_heads = 6 if not is_a10g else 1  # NOTE there will be bugs if this is not 1 when model_dim != 768
+    
+    if config.type in ['deepseek-mtp', 'base-mtp']:
+        assert hasattr(config, 'n_mtp_tokens') and config.n_mtp_tokens is not None, "n_mtp_tokens must be specified for deepseek-mtp or base-mtp"
+        # First ensure base seq_len is multiple of 128
+        config.seq_len = next_multiple_of_n(config.seq_len, n=128)
+        # Then add the n_tokens
+        config.seq_len = config.seq_len + config.n_mtp_tokens
+    
+    config.batch_size = world_size * config.seq_len
+    config.val_tokens = 10485760 if not is_a10g else 16*config.seq_len
+    config.gradient_accumulation_steps = math.ceil(8 / world_size)
+    config.effective_batch_size = config.batch_size * config.gradient_accumulation_steps
+    
+    return config
 
 
 
-def gen_name(model: nn.Module, args: TrainConfig, uuid: uuid.UUID):
+def gen_name(model: nn.Module, args, uuid: uuid.UUID):
     return (
         f'{model.__class__.__name__}_torch_compile={args.torch_compile}_{args.type}'
         f'_batch_size={args.batch_size}'
@@ -184,101 +162,33 @@ if master_process:
     print(logfile)
 
 
-def train(
-    # data
-    type: Literal['ngpt', 'deepseek-mtp', 'base-mtp', 'current-best', 'nsa', 'gpt2', 'sedd'] = 'current-best',
-    train_files: str = "data/fineweb10B/fineweb_train_*.bin",
-    val_files: str = "data/fineweb10B/fineweb_val_*.bin",
-    model_adapter: Optional[str] = None,
-    model_cfg: Optional[object] = None,
-    hydra_model_cfg: Optional[str] = None,
-    hydra_overrides: Optional[list[str]] = None,
-    # optimization
-    seq_len: int = 64*(1024) if not is_a10g else 16*(1024),
-    num_iterations: int = 1393,
-    cooldown_frac: float = 0.4,
-    # evaluation and logging
-    val_loss_every: int = 125,
-    # implementation
-    save_checkpoint: bool = False,
-    use_liger: bool = True,
-    use_adam_mini: bool = False,
-    num_layers: int = 12,
-    n_mtp_tokens: int = 2,
-    use_wandb: bool = True,
-    torch_compile: bool = True,
-    use_deepseek_mtp: bool = True,
-    proj_fp8: bool = False,
-    bfloat16: bool = False,
-    BLOCK_SIZE: int = 128,
-    IS_MODAL: bool = True,
-    model_dim: int = 768,
-    sliding_window_size: Optional[int] = None,
-    num_selected_blocks: Optional[int] = None,
-    compress_block_size: Optional[int] = None,
-    selection_block_size: Optional[int] = None,
-):
-    # Create config object from individual arguments
-    args = TrainConfig(
-        type=type,
-        model_adapter=model_adapter,
-        model_cfg=model_cfg,
-        train_files=train_files,
-        val_files=val_files,
-        num_iterations=num_iterations,
-        cooldown_frac=cooldown_frac,
-        val_loss_every=val_loss_every,
-        seq_len=seq_len,  # Default based on is_a10g
-        save_checkpoint=save_checkpoint,
-        use_liger=use_liger,
-        use_adam_mini=use_adam_mini,
-        num_layers=num_layers,
-        n_mtp_tokens=n_mtp_tokens,
-        model_dim=model_dim,
-        use_wandb=use_wandb,
-        torch_compile=torch_compile,
-        use_deepseek_mtp=use_deepseek_mtp,
-        proj_fp8=proj_fp8,
-        bfloat16=bfloat16,
-        BLOCK_SIZE=BLOCK_SIZE,
-        IS_MODAL=IS_MODAL,
-        sliding_window_size=sliding_window_size,
-        num_selected_blocks=num_selected_blocks,
-        compress_block_size=compress_block_size,
-        selection_block_size=selection_block_size
-    )
-    # Resolve adapter and build model
-    # Optional: load model_cfg via Hydra OmegaConf from YAML
-    if hydra_model_cfg is not None:
-        try:
-            from omegaconf import OmegaConf
-            _cfg = OmegaConf.load(hydra_model_cfg)
-            if hydra_overrides:
-                _over = OmegaConf.from_dotlist(list(hydra_overrides))
-                _cfg = OmegaConf.merge(_cfg, _over)
-            # prefer nested model_cfg key if present
-            args.model_cfg = _cfg.get('model_cfg', _cfg)
-        except Exception as e:
-            print0(f"Hydra/OmegaConf loading failed: {e}", console=True)
+@hydra.main(version_base=None, config_path="configs")
+def train(cfg: DictConfig):
+    # Convert Hydra config to our expected format
+    args = create_config_from_hydra(cfg)
+    
+    # Print config for debugging
+    print0(f"Loaded configuration: {OmegaConf.to_yaml(cfg)}", console=True)
 
+    # Resolve adapter and build model
     if args.model_adapter:
         adapter = load_adapter_from_path(args.model_adapter)
     else:
         adapter = resolve_adapter_by_type(args.type)
 
     # Validate/construct model cfg via adapter's Cfg if present
-    cfg = None
+    model_cfg = None
     cfg_cls = getattr(adapter, 'Cfg', None)
     if cfg_cls is not None:
         if args.model_cfg is None:
             try:
-                cfg = cfg_cls()
+                model_cfg = cfg_cls()
             except Exception:
-                cfg = None
+                model_cfg = None
         else:
-            cfg = args.model_cfg if isinstance(args.model_cfg, cfg_cls) else cfg_cls.model_validate(args.model_cfg)
+            model_cfg = args.model_cfg if isinstance(args.model_cfg, cfg_cls) else cfg_cls.model_validate(args.model_cfg)
 
-    model = adapter.build(args, cfg)
+    model = adapter.build(args, model_cfg)
         
     if args.use_wandb:
         import wandb
@@ -291,12 +201,13 @@ def train(
         )
 
     # load data
+    data_path = getattr(args, 'modal_data_path', None) if args.IS_MODAL else getattr(args, 'local_data_path', None)
     train_loader = distributed_data_generator(
         args.train_files, 
         args.batch_size,
         rank, 
         world_size,
-        from_path='/root/data/data/project' if args.IS_MODAL else None
+        from_path=data_path
     )
 
     # begin by printing this file (the Python code)
@@ -380,7 +291,7 @@ def train(
                 val_batch_size, 
                 rank, 
                 world_size,
-                from_path='/root/data/data/project' if args.IS_MODAL else None
+                from_path=data_path
             )
             val_loss = 0
             with torch.no_grad():
@@ -473,4 +384,5 @@ def train(
     )
     dist.destroy_process_group()
 
-fire.Fire(train) 
+if __name__ == "__main__":
+    train() 

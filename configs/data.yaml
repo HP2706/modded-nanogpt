@@ -1,0 +1,20 @@
+# Data configuration
+train_files: "data/fineweb10B/fineweb_train_*.bin"
+val_files: "data/fineweb10B/fineweb_val_*.bin"
+
+# Data processing
+seq_len: 65536  # 64*1024, will be adjusted based on hardware
+n_mtp_tokens: 2  # Additional tokens for MTP models
+
+# Validation settings
+val_tokens: 10485760  # Tokens to use for validation
+val_loss_every: 125   # Validate every N steps
+
+# Hardware-specific settings (will be overridden by trainer based on device)
+# A10G settings:
+#   seq_len: 16384  # 16*1024
+#   val_tokens: will be calculated as 16*seq_len
+
+# Modal/container paths
+modal_data_path: "/root/data/data/project"
+local_data_path: null  # Use current directory if null

@@ -1,24 +1,36 @@
 # Default training configuration
-train_files: "data/fineweb10B/fineweb_train_*.bin"
-val_files: "data/fineweb10B/fineweb_val_*.bin"
-val_tokens: 10485760
-train_seq_len: 49152  # 48*1024
-val_seq_len: 262144   # 4*64*1024
-num_iterations: 1750
-cooldown_frac: 0.45
-val_loss_every: 125
+# Optimization
+num_iterations: 1393
+cooldown_frac: 0.4
+
+# Model architecture  
+type: "current-best"  # Model type: 'ngpt', 'deepseek-mtp', 'base-mtp', 'current-best', 'nsa', 'gpt2', 'sedd'
+num_layers: 12
+model_dim: 768
+
+# Model-specific parameters
+n_mtp_tokens: 2  # For MTP models
+
+# Implementation settings
 save_checkpoint: false
 use_liger: true
 use_adam_mini: false
-num_layers: 12
-model_dim: 768
-use_wandb: true
 torch_compile: true
 proj_fp8: false
 bfloat16: false
 BLOCK_SIZE: 128
-IS_MODAL: false
+
+# Environment
+IS_MODAL: true
+use_wandb: true
+
+# Sliding window and compression (for applicable models)
 sliding_window_size: null
 num_selected_blocks: null
 compress_block_size: null
 selection_block_size: null
+use_deepseek_mtp: true
+
+# Model adapter override (optional)
+model_adapter: null  # Path to custom adapter, e.g., "my_module:MyAdapter" 
+model_cfg: null      # Optional model config override

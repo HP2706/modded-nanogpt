@@ -1,0 +1,6 @@
+# Base config that other model configs will inherit from
+# This won't be used directly, instead each model config will inherit from this
+defaults:
+  - data
+  - training
+  - _self_

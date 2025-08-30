@@ -1,7 +1,13 @@
-# Mamba model configuration
+# Mamba model configuration  
 defaults:
+  - data
   - training
+  - _self_
 
+# Model type
+type: "mamba"  # Note: Make sure this maps to the right adapter
+
+# Model-specific configuration
 model_cfg:
   vocab_size: 50257
   n_ctx: 1024
@@ -27,6 +33,6 @@ model_cfg:
   time_step_floor: 1e-4
   rescale_prenorm_residual: false
 
-# Override training parameters if needed
-train_seq_len: 1024
+# Override data/training parameters if needed
+seq_len: 1024  # Shorter sequence for Mamba
 num_iterations: 1750

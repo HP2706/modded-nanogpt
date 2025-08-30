@@ -1,7 +1,13 @@
 # NGPT model configuration
 defaults:
+  - data
   - training
+  - _self_
 
+# Model type
+type: "ngpt"
+
+# Model-specific configuration
 model_cfg:
   vocab_size: 50257
   num_layers: 12
@@ -10,5 +16,4 @@ model_cfg:
   use_fp8: false
 
 # Override training parameters if needed
-train_seq_len: 49152
 num_iterations: 1750
