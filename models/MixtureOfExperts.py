@@ -1,10 +1,12 @@
-import time
-from types import SimpleNamespace
-from pydantic import Field, model_validator, root_validator
 from typing import Any, List, Literal, Optional, Union, cast
+
 import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
+from pydantic import Field, model_validator
+from jaxtyping import jaxtyped, Int, Float
+from beartype import beartype
+
 from Models.Blocks import (
     MixtralBlockSparseTop2MLP,
     UnEmbedding,
@@ -14,8 +16,11 @@ from Models.Blocks import (
 from Models.LLMS.VanillaTransformer import VanillaTransformerBlock
 from Models.LLMS.LLMBase import ModelMixin, ModelOutputMixin, TransformerMixin
 from Models.LLMS.configs import BaseTransformerConfig, ModelConfig
-from jaxtyping import jaxtyped, Int, Float
-from beartype import beartype
+from trainer_registry import (
+    DefaultAdapter,
+    _default_group_params_for_gpt_like,
+    _adam_muon_optimizers,
+)
 
 class MoEOutput(ModelOutputMixin):
     #the sum of these losses is the loss term in the model
@@ -273,3 +278,40 @@ class MoEConfig(BaseTransformerConfig):
         if values.get("beta") and values.get("betas"):
             raise ValueError("Only one of beta or betas can be set, not both.")
         return values
+
+
+# ---- Adapter + Config for trainer integration ----
+
+
+class MoEAdapter(DefaultAdapter):
+    Cfg = MoEConfig
+
+    def build(self, args, cfg: Optional[MoEConfig]):
+        cfg = cfg or MoEConfig(
+            vocab_size=50257,
+            n_layers=args.num_layers,
+            n_heads=args.num_heads,
+            d_model=args.model_dim,
+            num_experts=8,
+            top_k=2,
+            alpha=0.01,
+            beta=0.001,
+        )
+        # Fill in any missing required fields from args
+        if not hasattr(cfg, 'n_layers') or cfg.n_layers is None:
+            cfg.n_layers = args.num_layers
+        if not hasattr(cfg, 'n_heads') or cfg.n_heads is None:
+            cfg.n_heads = args.num_heads
+        if not hasattr(cfg, 'd_model') or cfg.d_model is None:
+            cfg.d_model = args.model_dim
+            
+        model = MoETransformer(cfg, is_master_process=True).cuda()
+        return model
+
+    def train_step(self, model, inputs, targets, sw_num_blks, *, loss_scale, args):
+        loss = model.forward(inputs.view(1, -1), targets.view(1, -1)).loss
+        (loss_scale * loss).backward()
+        return loss, {}
+
+    def val_step(self, model, inputs, targets, sw_num_blks, *, args):
+        return model.forward(inputs.view(1, -1), targets.view(1, -1)).loss

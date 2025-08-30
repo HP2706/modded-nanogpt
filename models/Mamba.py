@@ -1,31 +1,33 @@
 # Copyright (c) 2023, Albert Gu, Tri Dao.
 
 import math
+from dataclasses import dataclass
 from functools import partial
-from Models.LLMS.LLMBase import ModelMixin
-from utils import LRConfig, get_device
-from Models.LLMS.LLMBase import ModelOutputMixin
-from Models.Blocks import GatedMLP
-from jaxtyping import Float, Int
+from typing import Optional, Tuple, Literal
+
 import torch
 import torch.nn as nn
+from torch import nn, Tensor
+from pydantic import Field
+from jaxtyping import Float, Int
 
+from Models.LLMS.LLMBase import ModelMixin, ModelOutputMixin
+from Models.LLMS.configs import ModelConfig
+from Models.Blocks import GatedMLP
+from utils import LRConfig, get_device
+from trainer_registry import (
+    DefaultAdapter,
+    _default_group_params_for_gpt_like,
+    _adam_muon_optimizers,
+)
 
 if get_device() == "cuda":
     try:
         from mamba_ssm.modules.mamba_simple import Mamba as MambaMixer
         from mamba_ssm.modules.mamba2 import Mamba2 as Mamba2Mixer
-        from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
         from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
     except ImportError:
         RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
-
-from dataclasses import dataclass
-from pydantic import BaseModel, Field
-from Models.LLMS.configs import ModelConfig
-from typing import Optional, Tuple, Literal
-import torch
-from torch import nn, Tensor
 
 
 
@@ -233,3 +235,70 @@ class Mamba(ModelMixin):
             ce_loss = F.cross_entropy(lm_logits.view(-1, lm_logits.size(-1)), position_ids.view(-1))
             return ModelOutputMixin(logits=lm_logits, loss=ce_loss)
         return ModelOutputMixin(logits=lm_logits)
+
+
+# ---- Adapter + Config for trainer integration ----
+
+
+class MambaAdapter(DefaultAdapter):
+    Cfg = MambaConfig
+
+    def build(self, args, cfg: Optional[MambaConfig]):
+        cfg = cfg or MambaConfig(
+            vocab_size=50257,
+            d_model=args.model_dim,
+            n_layers=args.num_layers,
+            d_state=16,
+            d_conv=4,
+            expand=2,
+        )
+        # Fill in any missing required fields from args
+        if not hasattr(cfg, 'n_layers') or cfg.n_layers is None:
+            cfg.n_layers = args.num_layers
+        if not hasattr(cfg, 'd_model') or cfg.d_model is None:
+            cfg.d_model = args.model_dim
+            
+        model = Mamba(cfg, is_master_process=True).cuda()
+        return model
+
+    def create_optimizers(self, model, args, *, rank, world_size, device):
+        # Group params: categorize by ndim and names for Mamba
+        hidden_matrix_params, embed_params, scalar_params, head_params = [], [], [], []
+        for name, p in model.named_parameters():
+            if p.ndim < 2:
+                scalar_params.append(p)
+            elif 'embedding' in name:
+                embed_params.append(p)
+            elif 'lm_head' in name:
+                head_params.append(p)
+            else:
+                hidden_matrix_params.append(p)
+
+        optimizer1, optimizer2 = _adam_muon_optimizers(
+            hidden_matrix_params=hidden_matrix_params,
+            embed_params=embed_params,
+            scalar_params=scalar_params,
+            head_params=head_params,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+        )
+
+        def get_lr(step: int):
+            t = 1 - step / args.num_iterations
+            w = min(t / args.cooldown_frac, 1.0)
+            return w * 1.0 + (1 - w) * 0.1
+
+        schedulers = [
+            torch.optim.lr_scheduler.LambdaLR(optimizer1, get_lr),
+            torch.optim.lr_scheduler.LambdaLR(optimizer2, get_lr),
+        ]
+        return [optimizer1, optimizer2], schedulers
+
+    def train_step(self, model, inputs, targets, sw_num_blks, *, loss_scale, args):
+        loss = model.forward(inputs.view(1, -1), targets.view(1, -1)).loss
+        (loss_scale * loss).backward()
+        return loss, {}
+
+    def val_step(self, model, inputs, targets, sw_num_blks, *, args):
+        return model.forward(inputs.view(1, -1), targets.view(1, -1)).loss

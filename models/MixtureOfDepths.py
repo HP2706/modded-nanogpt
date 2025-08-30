@@ -1,14 +1,13 @@
 #this file contains code inspired by: https://github.com/astramind-ai/Mixture-of-depths/tree/main
-import time
 from typing import Optional, Union
-from numpy import dtype
-from pydantic import BaseModel, Field
-from sentry_sdk import is_initialized
+
 import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
 from beartype import beartype
 from jaxtyping import jaxtyped, Int, Float, Bool
+from pydantic import Field
+
 from Models.LLMS.VanillaTransformer import VanillaTransformerBlock
 from modelutils import create_mask
 from Models.Blocks import (
@@ -16,10 +15,13 @@ from Models.Blocks import (
     MultiHeadAttention,
     MLP
 )
-from Models.LLMS.LLMBase import ModelMixin, TransformerMixin
+from Models.LLMS.LLMBase import ModelMixin, TransformerMixin, ModelOutputMixin
 from Models.LLMS.configs import BaseTransformerConfig
-
-from Models.LLMS.LLMBase import ModelOutputMixin
+from trainer_registry import (
+    DefaultAdapter,
+    _default_group_params_for_gpt_like,
+    _adam_muon_optimizers,
+)
 
 class MoDOutput(ModelOutputMixin):
     ce_loss: Optional[Tensor] = None
@@ -204,3 +206,36 @@ class MoDConfig(BaseTransformerConfig):
             "if true, only every second block is a Mod and the rest is regular transformerblock"
         ),
     )
+
+
+# ---- Adapter + Config for trainer integration ----
+
+
+class MoDAdapter(DefaultAdapter):
+    Cfg = MoDConfig
+
+    def build(self, args, cfg: Optional[MoDConfig]):
+        cfg = cfg or MoDConfig(
+            vocab_size=50257,
+            n_layers=args.num_layers,
+            n_heads=args.num_heads,
+            d_model=args.model_dim,
+        )
+        # Fill in any missing required fields from args
+        if not hasattr(cfg, 'n_layers') or cfg.n_layers is None:
+            cfg.n_layers = args.num_layers
+        if not hasattr(cfg, 'n_heads') or cfg.n_heads is None:
+            cfg.n_heads = args.num_heads
+        if not hasattr(cfg, 'd_model') or cfg.d_model is None:
+            cfg.d_model = args.model_dim
+            
+        model = MoDTransformer(cfg, is_master_process=True).cuda()
+        return model
+
+    def train_step(self, model, inputs, targets, sw_num_blks, *, loss_scale, args):
+        loss = model.forward(inputs.view(1, -1), targets.view(1, -1)).loss
+        (loss_scale * loss).backward()
+        return loss, {}
+
+    def val_step(self, model, inputs, targets, sw_num_blks, *, args):
+        return model.forward(inputs.view(1, -1), targets.view(1, -1)).loss

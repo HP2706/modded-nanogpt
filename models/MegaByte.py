@@ -1,16 +1,21 @@
-from typing import List, Optional
-from pydantic import BaseModel, Field
-from typing import Literal
+from typing import List, Optional, Literal
+
+import torch
+from torch import nn, Tensor
+from torch.nn import functional as F
+from pydantic import Field
+from jaxtyping import Float, Int
+from einops import rearrange
+
 from Models.LLMS.configs import ModelConfig
 from Models.LLMS.LLMBase import ModelMixin, ModelOutputMixin
 from Models.Blocks import GatedMLP, MultiHeadAttention, RMSNorm, RotaryEmbedding
-from torch import nn
-from torch import Tensor
-from jaxtyping import Float, Int
-import torch
-from einops import rearrange
 from utils import text_to_bytes
-from torch.nn import functional as F
+from trainer_registry import (
+    DefaultAdapter,
+    _default_group_params_for_gpt_like,
+    _adam_muon_optimizers,
+)
 
 
 class MegaByteConfig(ModelConfig):
@@ -223,3 +228,77 @@ class MegaByte(ModelMixin):
                 logits=x
             )
         return ModelOutputMixin(logits=x)
+
+
+# ---- Adapter + Config for trainer integration ----
+
+
+class MegaByteAdapter(DefaultAdapter):
+    Cfg = MegaByteConfig
+
+    def build(self, args, cfg: Optional[MegaByteConfig]):
+        cfg = cfg or MegaByteConfig(
+            vocab_size=50257,
+            d_local=args.model_dim,
+            d_global_pre_patch=args.model_dim,
+            n_layers_d_global=4,
+            n_layers_d_local=2,
+            local_n_heads=args.num_heads,
+            global_n_heads=args.num_heads,
+            d_mult=1,
+            patch_size=4,
+        )
+        # Fill in any missing required fields from args
+        if not hasattr(cfg, 'd_local') or cfg.d_local is None:
+            cfg.d_local = args.model_dim
+        if not hasattr(cfg, 'd_global_pre_patch') or cfg.d_global_pre_patch is None:
+            cfg.d_global_pre_patch = args.model_dim
+        if not hasattr(cfg, 'local_n_heads') or cfg.local_n_heads is None:
+            cfg.local_n_heads = args.num_heads
+        if not hasattr(cfg, 'global_n_heads') or cfg.global_n_heads is None:
+            cfg.global_n_heads = args.num_heads
+            
+        model = MegaByte(cfg, is_master_process=True).cuda()
+        return model
+
+    def create_optimizers(self, model, args, *, rank, world_size, device):
+        # Group params: categorize by ndim and names for MegaByte
+        hidden_matrix_params, embed_params, scalar_params, head_params = [], [], [], []
+        for name, p in model.named_parameters():
+            if p.ndim < 2:
+                scalar_params.append(p)
+            elif 'embedding' in name or 'embed' in name:
+                embed_params.append(p)
+            elif 'lm_head' in name:
+                head_params.append(p)
+            else:
+                hidden_matrix_params.append(p)
+
+        optimizer1, optimizer2 = _adam_muon_optimizers(
+            hidden_matrix_params=hidden_matrix_params,
+            embed_params=embed_params,
+            scalar_params=scalar_params,
+            head_params=head_params,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+        )
+
+        def get_lr(step: int):
+            t = 1 - step / args.num_iterations
+            w = min(t / args.cooldown_frac, 1.0)
+            return w * 1.0 + (1 - w) * 0.1
+
+        schedulers = [
+            torch.optim.lr_scheduler.LambdaLR(optimizer1, get_lr),
+            torch.optim.lr_scheduler.LambdaLR(optimizer2, get_lr),
+        ]
+        return [optimizer1, optimizer2], schedulers
+
+    def train_step(self, model, inputs, targets, sw_num_blks, *, loss_scale, args):
+        loss = model.forward(inputs.view(1, -1), targets.view(1, -1)).loss
+        (loss_scale * loss).backward()
+        return loss, {}
+
+    def val_step(self, model, inputs, targets, sw_num_blks, *, args):
+        return model.forward(inputs.view(1, -1), targets.view(1, -1)).loss

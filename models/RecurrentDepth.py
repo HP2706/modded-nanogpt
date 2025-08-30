@@ -3,14 +3,20 @@
 # github: https://github.com/seal-rg/recurrent-pretraining.git
 
 from typing import Optional, Literal
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Int, Float
 
-from models.LLMBase import TransformerMixin, ModelOutputMixin
-from models.configs import BaseTransformerConfig
-from models.gpt2 import Block
+from Models.LLMS.LLMBase import TransformerMixin, ModelOutputMixin
+from Models.LLMS.configs import BaseTransformerConfig
+from Models.LLMS.gpt2 import Block
+from trainer_registry import (
+    DefaultAdapter,
+    _default_group_params_for_gpt_like,
+    _adam_muon_optimizers,
+)
 
 
 class RecurrentDepthOutput(ModelOutputMixin):
@@ -167,3 +173,37 @@ class RecurrentDepthConfig(BaseTransformerConfig):
 
     class Config:
         arbitrary_types_allowed = True
+
+
+# ---- Adapter + Config for trainer integration ----
+
+
+class RecurrentDepthAdapter(DefaultAdapter):
+    Cfg = RecurrentDepthConfig
+
+    def build(self, args, cfg: Optional[RecurrentDepthConfig]):
+        cfg = cfg or RecurrentDepthConfig(
+            vocab_size=50257,
+            n_layers=args.num_layers,
+            n_heads=args.num_heads,
+            d_model=args.model_dim,
+            depth_factor=2,
+        )
+        # Fill in any missing required fields from args
+        if not hasattr(cfg, 'n_layers') or cfg.n_layers is None:
+            cfg.n_layers = args.num_layers
+        if not hasattr(cfg, 'n_heads') or cfg.n_heads is None:
+            cfg.n_heads = args.num_heads
+        if not hasattr(cfg, 'd_model') or cfg.d_model is None:
+            cfg.d_model = args.model_dim
+            
+        model = RecurrentDepth(cfg, is_master_process=True).cuda()
+        return model
+
+    def train_step(self, model, inputs, targets, sw_num_blks, *, loss_scale, args):
+        loss = model.forward(inputs.view(1, -1), targets.view(1, -1)).loss
+        (loss_scale * loss).backward()
+        return loss, {}
+
+    def val_step(self, model, inputs, targets, sw_num_blks, *, args):
+        return model.forward(inputs.view(1, -1), targets.view(1, -1)).loss

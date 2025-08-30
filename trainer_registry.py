@@ -187,4 +187,15 @@ ADAPTER_PATHS: Dict[str, str] = {
     "nsa": "models.Nsa:NSAAdapter",
     "gpt2": "models.gpt2:GPT2Adapter",
     "sedd": "models.SEDD:SEDDAdapter",
+    # New model adapters from our recent fixes
+    "mamba": "models.Mamba:MambaAdapter",
+    "megabyte": "models.MegaByte:MegaByteAdapter", 
+    "mixture-of-depths": "models.MixtureOfDepths:MoDAdapter",
+    "mixture-of-experts": "models.MixtureOfExperts:MoEAdapter",
+    "mdlm": "models.MDLM:MDLMAdapter",
+    "d3pm": "models.D3PM:D3PMAdapter",
+    "recurrent-depth": "models.RecurrentDepth:RecurrentDepthAdapter",
+    "vanilla": "models.VanillaTransformer:VanillaAdapter",
+    "ttt": "models.ttt:TTTAdapter",
+    "titans": "models.titans:TitansAdapter",
 }
