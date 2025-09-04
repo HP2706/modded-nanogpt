@@ -29,7 +29,7 @@ async def main():
         },
         {
             "role": "user",
-            "content": f"from absolute path {os.getcwd()} write a tiny mlp demo in scratchpad.py that makes a forward pass and prints the output, then run via python in bash",
+            "content": f"from absolute path {os.getcwd()} edit scratchpad.py so instead of implementing an mlp it implements a transformer",
         },
         
     ]

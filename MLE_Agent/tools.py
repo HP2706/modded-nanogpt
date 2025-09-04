@@ -183,8 +183,10 @@ class MCPBashTool(MCPTool):
     MCP implementation copying BashTool20250124 from anthropic_tools.
     Allows running bash commands with MCP protocol.
     """
+    # Use PrivateAttr so Pydantic BaseModel allows this private state
+    _session: Any = PrivateAttr(default=None)
+
     def __init__(self):
-        self._session = None
         super().__init__(
             name="bash",
             description="Run bash commands. You can execute shell commands and get their output. Use 'restart: true' to start a new shell session.",
@@ -244,10 +246,10 @@ class MCPEditTool(MCPTool):
     Allows viewing, creating, editing files with MCP protocol.
     """
 
-    _file_history: dict[Path, list[str]]
+    # Private attribute to store file edit history across calls
+    _file_history: dict[Path, list[str]] = PrivateAttr(default_factory=lambda: defaultdict(list))
 
     def __init__(self):
-        self._file_history = defaultdict(list)
         super().__init__(
             name="str_replace_editor",
             description="A tool for viewing, creating, and editing files. Supports viewing file contents, creating new files, replacing strings in files, and inserting text at specific lines.",
