@@ -14,5 +14,6 @@ einx
 einops
 jaxtyping
 matplotlib
+mcp
 fla @ git+https://github.com/fla-org/flash-linear-attention.git
 transformer_nuggets @ git+https://github.com/drisspg/transformer_nuggets

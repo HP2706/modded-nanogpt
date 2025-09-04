@@ -40,7 +40,7 @@ async def main():
         async with ClientSession(read, write) as session:
             await session.initialize()
             #tools = await session.list_tools()                    
-            max_iters = 2
+            max_iters = 10
             iters = 0
             while iters < max_iters:
                 
@@ -76,7 +76,6 @@ async def main():
                             'tool_call_id': tool_call.id,
                             'content': "\n".join(out_texts) if out_texts else str(result)
                         })
-                print('messages:', messages)
     
     
 
@@ -98,6 +97,15 @@ async def main():
 """
 
 
+async def test_client():
+    params = StdioServerParameters(command="python", args=["mcp_server.py"])
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            for _ in range(10):
+                result = await session.call_tool("bash", {"command": "ls -la"})
+                print('result:', result)
 
 if __name__ == "__main__":
+    #asyncio.run(test_client())
     asyncio.run(main())

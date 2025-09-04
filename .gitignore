@@ -9,3 +9,5 @@ models/hnet_ref/*
 test.py
 outputs/
 papers/
+snippets/
+anthropic_tools/
