@@ -1,6 +1,6 @@
 numpy
 tqdm
-torch
+torch==2.7.0
 huggingface-hub
 liger-kernel
 wandb<=0.18.7
@@ -15,5 +15,5 @@ einops
 jaxtyping
 matplotlib
 mcp
-fla @ git+https://github.com/fla-org/flash-linear-attention.git
-transformer_nuggets @ git+https://github.com/drisspg/transformer_nuggets
+#fla @ git+https://github.com/fla-org/flash-linear-attention.git
+#transformer_nuggets @ git+https://github.com/drisspg/transformer_nuggets

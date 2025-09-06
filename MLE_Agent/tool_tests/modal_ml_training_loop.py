@@ -14,6 +14,10 @@ import os
 import asyncio
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp import ClientSession
+import sys
+sys.path.append('..')
+
+from MLE_Agent.tools.format_tool import format_print_tool
 
 
 TRAIN_SCRIPT = r"""
@@ -55,60 +59,76 @@ async def main():
 
     params = StdioServerParameters(command="python", args=["mcp_server.py"], env=env)
 
-    # Target path inside the Modal sandbox volume mounted at /root/sandbox
-    target_path = "/root/sandbox/train_tiny.py"
+    # Will resolve inside the bash session's run directory
+    target_path = None
 
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            # 0) Ensure no stale file remains from a previous run
-            _ = await session.call_tool(
-                "bash",
-                {"command": f"rm -f {target_path}"},
-            )
+            # 0) Discover the bash session run_dir via startup message and ensure no stale file remains
+            args = {}
+            start_res = await session.call_tool("bash", args)
+            format_print_tool("bash", args, start_res)
+            # Expect: "tool started. cwd: <run_dir>" or "tool has been restarted. cwd: <run_dir>"
+            msg = start_res.content[0].text
+            run_dir = "/root/sandbox"
+            if "cwd:" in msg:
+                try:
+                    run_dir = msg.split("cwd:", 1)[1].strip()
+                except Exception:
+                    pass
+            target_path = f"{run_dir}/train_tiny.py"
+            args = {"command": f"rm -f {target_path}"}
+            _ = await session.call_tool("bash", args)
 
             # 1) Create the training script file in the sandbox
+            args = {"command": "create", "path": target_path, "file_text": TRAIN_SCRIPT}
             create_res = await session.call_tool(
                 "str_replace_editor",
-                {"command": "create", "path": target_path, "file_text": TRAIN_SCRIPT},
+                args,
             )
-            print("Create result:", create_res)
+            format_print_tool("str_replace_editor", args, create_res)
 
             # 2) Optional: view the file (sanity check)
+            args = {"command": "view", "path": target_path}
             view_res = await session.call_tool(
                 "str_replace_editor",
-                {"command": "view", "path": target_path},
+                args,
             )
-            print("View result:", view_res)
+            format_print_tool("str_replace_editor", args, view_res)
 
             # 3) Start training in the background (unbuffered python) and peek logs every 5 seconds
+            args = {"command": f"python -u {target_path}", "background": True, "name": "tiny-train"}
             start_res = await session.call_tool(
                 "bash",
-                {"command": "python -u train_tiny.py", "background": True, "name": "tiny-train"},
+                args,
             )
-            print("Start result:", start_res)
+            format_print_tool("bash", args, start_res)
 
             # Peek and poll a few times
             for i in range(5):
                 await asyncio.sleep(5)
+                args_peek = {"peek": True, "name": "tiny-train", "lines": 50}
                 peek_res = await session.call_tool(
                     "bash",
-                    {"peek": True, "name": "tiny-train", "lines": 50},
+                    args_peek,
                 )
-                print(f"Peek {i+1}:", peek_res)
+                format_print_tool("bash", args_peek, peek_res)
+                args_poll = {"poll": True, "name": "tiny-train"}
                 poll_res = await session.call_tool(
                     "bash",
-                    {"poll": True, "name": "tiny-train"},
+                    args_poll,
                 )
-                print(f"Poll {i+1}:", poll_res)
+                format_print_tool("bash", args_poll, poll_res)
 
             # Optionally stop the job (training script will exit on its own soon)
+            args = {"stop": True, "name": "tiny-train"}
             stop_res = await session.call_tool(
                 "bash",
-                {"stop": True, "name": "tiny-train"},
+                args,
             )
-            print("Stop result:", stop_res)
+            format_print_tool("bash", args, stop_res)
 
 
 if __name__ == "__main__":

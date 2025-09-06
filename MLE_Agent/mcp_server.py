@@ -26,8 +26,8 @@ app = Server("modal-server")
 # Optionally run tools inside a shared Modal Sandbox when env is set
 _use_modal = os.environ.get("USE_MODAL_SANDBOX", "0") == "1"
 _shared_sandbox = None
+
 if _use_modal:
-        
     modal_app = modal.App.lookup("mle-agent-tools", create_if_missing=True)
 
     image = modal.Image.from_registry(
@@ -44,6 +44,11 @@ if _use_modal:
         'einx',
         'matplotlib',
     )
+    
+    image = image.add_local_file(
+        'modded-nanogpt.py',
+        '/root/modded-nanogpt.py'
+    )
 
 
     try:
@@ -51,7 +56,8 @@ if _use_modal:
             app=modal_app,
             image=image,
             volumes={
-                "/root/sandbox": modal.Volume.from_name("mle-sandbox", create_if_missing=True)
+                "/root/sandbox": modal.Volume.from_name("mle-sandbox", create_if_missing=True),
+                '/root/fineweb10B': modal.Volume.from_name("fineweb10B", create_if_missing=True) # the fineweb10B dataset
             },
             timeout=30
         )

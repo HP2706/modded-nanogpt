@@ -6,6 +6,9 @@ from pydantic import PrivateAttr
 from .shared import MCPTool
 import sys
 import shlex
+import datetime
+import shutil
+from pathlib import Path
 from typing import Dict
 
 # if on macos we infer we are local and use the current directory
@@ -34,15 +37,30 @@ class _BashSession:
         self._started = False
         self._timed_out = False
         self._automount_path = automount_path
+        ts = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+        self._run_dir = os.path.join(self._automount_path, "runs", ts)
 
     async def start(self):
         if self._started:
             return
 
+        # Ensure dated run directory exists and copy modded-nanogpt.py if present
+        os.makedirs(self._run_dir, exist_ok=True)
+        for src in [
+            Path.cwd() / "modded-nanogpt.py",
+            Path(self._automount_path).parent / "modded-nanogpt.py",
+        ]:
+            if src.is_file():
+                try:
+                    shutil.copy2(src, Path(self._run_dir) / "modded-nanogpt.py")
+                except Exception:
+                    pass
+                break
+
         self._process = await asyncio.create_subprocess_shell(
             self.command,
             preexec_fn=os.setsid,
-            cwd=self._automount_path,
+            cwd=self._run_dir,
             shell=True,
             bufsize=0,
             stdin=asyncio.subprocess.PIPE,
@@ -139,16 +157,23 @@ class _ModalBashSession:
         self._root = root
         self._started = False
         self._timed_out = False
+        ts = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+        self._run_dir = f"{self._root}/runs/{ts}"
 
     async def start(self):
         if self._started:
             return
-        # Start a long-lived interactive bash in the sandbox rooted at self._root
-        # Use 'bash -lc' to run an initial cd and then a login shell
+        # Prepare run directory and copy modded-nanogpt.py if present
+        setup = (
+            f"mkdir -p {shlex.quote(self._run_dir)} && "
+            f"( [ -f /root/modded-nanogpt.py ] && cp /root/modded-nanogpt.py {shlex.quote(self._run_dir)}/ || true ) && "
+            f"( [ -f {shlex.quote(self._root)}/modded-nanogpt.py ] && cp {shlex.quote(self._root)}/modded-nanogpt.py {shlex.quote(self._run_dir)}/ || true )"
+        )
+        # Start a long-lived interactive bash in the run directory
         self._process = self._sandbox.exec(
             "bash",
             "-lc",
-            f"cd {shlex.quote(self._root)} && {self.command}",
+            f"{setup} && cd {shlex.quote(self._run_dir)} && exec {self.command}",
             bufsize=1,
         )
         self._started = True
@@ -299,14 +324,26 @@ class MCPBashTool(MCPTool):
                     self._modal_session.stop()
                 self._modal_session = _ModalBashSession(self._sandbox, root=self._sandbox_root)
                 await self._modal_session.start()
-                return [TextContent(type="text", text="tool has been restarted.")]
+                return [TextContent(type="text", text=f"tool has been restarted. cwd: {self._modal_session._run_dir}")]
 
             if self._modal_session is None:
                 self._modal_session = _ModalBashSession(self._sandbox, root=self._sandbox_root)
                 await self._modal_session.start()
 
+            # If no actionable flags and no command, return cwd info to help callers discover run_dir
+            if (
+                command is None
+                and not background
+                and not peek
+                and not stop
+                and not list_jobs
+                and not poll
+            ):
+                return [TextContent(type="text", text=f"tool started. cwd: {self._modal_session._run_dir}")]
+
             # Handle background/list/peek/stop/poll controls (Modal)
-            logs_dir = f"{self._sandbox_root}/.mcp_logs"
+            # Place logs under the per-session run directory
+            logs_dir = f"{self._modal_session._run_dir}/.mcp_logs"
 
             if list_jobs:
                 if not self._jobs:
@@ -357,7 +394,12 @@ class MCPBashTool(MCPTool):
                 job = self._jobs.get(name)
                 if not job:
                     raise ValueError(f"unknown job '{name}'")
-                out = await self._modal_session.run(f"tail -n {lines} {shlex.quote(job['log'])}")
+                log = shlex.quote(job['log'])
+                cmd = (
+                    f"if [ -f {log} ]; then tail -n {lines} {log}; "
+                    f"else echo 'no logs yet for {name}'; fi"
+                )
+                out = await self._modal_session.run(cmd)
                 return out
 
             if stop:
@@ -391,14 +433,26 @@ class MCPBashTool(MCPTool):
                 self._session.stop()
             self._session = _BashSession(automount_path=self._automount_path)
             await self._session.start()
-            return [TextContent(type="text", text="tool has been restarted.")]
+            return [TextContent(type="text", text=f"tool has been restarted. cwd: {self._session._run_dir}")]
 
         if self._session is None:
             self._session = _BashSession(automount_path=self._automount_path)
             await self._session.start()
 
+        # If no actionable flags and no command, return cwd info to help callers discover run_dir
+        if (
+            command is None
+            and not background
+            and not peek
+            and not stop
+            and not list_jobs
+            and not poll
+        ):
+            return [TextContent(type="text", text=f"tool started. cwd: {self._session._run_dir}")]
+
         # Background/list/peek/stop/poll for local mode
-        logs_dir = os.path.join(self._automount_path, ".mcp_logs")
+        # Place logs under the per-session run directory
+        logs_dir = os.path.join(self._session._run_dir, ".mcp_logs")
         if list_jobs:
             if not self._jobs:
                 return [TextContent(type="text", text="No background jobs.")]
@@ -447,7 +501,10 @@ class MCPBashTool(MCPTool):
             job = self._jobs.get(name)
             if not job:
                 raise ValueError(f"unknown job '{name}'")
-            out = await self._session.run(f"tail -n {lines} {shlex.quote(job['log'])}")
+            log = shlex.quote(job['log'])
+            out = await self._session.run(
+                f"if [ -f {log} ]; then tail -n {lines} {log}; else echo 'no logs yet for {name}'; fi"
+            )
             return out
 
         if stop:

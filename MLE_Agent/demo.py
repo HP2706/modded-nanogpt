@@ -5,7 +5,7 @@ except Exception:
     # Optional dependency not required for simple MCP tool demos
     Agent = Runner = None  # type: ignore
 import os
-from mcp_server import app as mcp_app, TOOLS, call_tool as server_call_tool
+from mcp_server import TOOLS
 from pprint import pprint
 import asyncio
 from mcp import ClientSession, StdioServerParameters, stdio_client
@@ -31,9 +31,7 @@ async def main():
             "role": "user",
             "content": f"from absolute path {os.getcwd()} edit scratchpad.py so instead of implementing an mlp it implements a transformer",
         },
-        
     ]
-
     
     params = StdioServerParameters(command="python", args=["mcp_server.py"])
     async with stdio_client(params) as (read, write):

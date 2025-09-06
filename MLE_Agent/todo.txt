@@ -1,0 +1,3 @@
+# todo
+
+## implement mcp where logs are streamed in https://thenewstack.io/how-mcp-uses-streamable-http-for-real-time-ai-tool-interaction/
