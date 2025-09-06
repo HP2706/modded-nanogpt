@@ -45,9 +45,8 @@ image = (
     ).run_commands(
         "git config --global user.name \"$GIT_USER_NAME\"",
         "git config --global user.email \"$GIT_USER_EMAIL\""
-    ).run_commands(
-        "pip install --pre torch==2.7.0.dev20250110+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade",
-        "pip install -r /root/requirements.txt"
+    ).uv_pip_install(
+        requirements=['requirements.txt']
     ).env(
         {
             "HUGGINGFACE_HUB_CACHE": "/root/models/hf"

@@ -13,16 +13,54 @@ from mcp.server import Server
 from pydantic import AnyUrl
 
 # Import our MCP tools
-from tools import MCPBashTool, MCPEditTool
+from tools.edit import MCPEditTool
+from tools.bash import MCPBashTool
+import os
+import modal
 
 logger = logging.getLogger(__name__)
 
 app = Server("modal-server")
 
 # Initialize MCP tools
-bash_tool = MCPBashTool()
-edit_tool = MCPEditTool()
+# Optionally run tools inside a shared Modal Sandbox when env is set
+_use_modal = os.environ.get("USE_MODAL_SANDBOX", "0") == "1"
+_shared_sandbox = None
+if _use_modal:
+        
+    modal_app = modal.App.lookup("mle-agent-tools", create_if_missing=True)
 
+    image = modal.Image.from_registry(
+        "nvidia/cuda:12.4.0-devel-ubuntu22.04", 
+        add_python="3.12"
+    ).uv_pip_install(
+        'torch',
+        'transformers',
+        'datasets',
+        'einops',
+        'psutil',
+        'hf-transfer',
+        'fire',
+        'einx',
+        'matplotlib',
+    )
+
+
+    try:
+        _shared_sandbox = modal.Sandbox.create(
+            app=modal_app,
+            image=image,
+            volumes={
+                "/root/sandbox": modal.Volume.from_name("mle-sandbox", create_if_missing=True)
+            },
+            timeout=30
+        )
+    except Exception as e:
+        logger.warning(f"Could not start Modal Sandbox, falling back to local tools: {e}")
+        _shared_sandbox = None
+
+bash_tool = MCPBashTool(sandbox=_shared_sandbox) if _shared_sandbox else MCPBashTool()
+edit_tool = MCPEditTool(sandbox=_shared_sandbox) if _shared_sandbox else MCPEditTool()
 # List of available tools for direct access
 TOOLS = [bash_tool, edit_tool]
 
@@ -97,12 +135,12 @@ async def call_tool(
             TextContent(type="text", text=f"Error executing tool {name}: {str(e)}")
         ]
 
-
 async def main():
     from mcp.server.stdio import stdio_server
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
+
 
 if __name__ == "__main__":
     asyncio.run(main())

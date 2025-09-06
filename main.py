@@ -1,7 +1,8 @@
 from modal_common import volume, image, app, ssh_function_wrapper, maybe_upload_project, train_gpt
-from modal import Secret, gpu
+from modal import Secret
 import argparse
 import argparse
+import torch
 
 KILL_AFTER = 60 * 60 * 14 # 14 hours
 @app.function(
@@ -19,11 +20,7 @@ def ssh_function():
 
 @app.local_entrypoint()
 def main():
-    
-    #print(volume.listdir('data'))
-    maybe_upload_project()
-    #ssh_function.remote()
-    
+    # Method 4: Modify GPU after function creation (most direct approach)
     """ train_gpt.remote(
         type='nsa',
         #torch_compile=True,

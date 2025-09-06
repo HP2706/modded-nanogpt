@@ -1,234 +1,11 @@
-# tools for reading, writing, applying code edits..
-# This file contains MCP implementations that copy code from anthropic_tools with proper attribution
-# Using only MCP types and standard Python types, no external tool framework dependencies
-from openai.types.shared_params.function_definition import FunctionDefinition
-from openai.types.chat.chat_completion_tool_union_param import ChatCompletionFunctionToolParam
-import asyncio
-import json
-import logging
-import os
-from collections import defaultdict
-from pathlib import Path
-from typing import Any, Literal, Sequence, get_args
-
-from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
+from typing import Any, Literal, Sequence
+from mcp.types import TextContent
 from pydantic import PrivateAttr
-
-logger = logging.getLogger(__name__)
-
-# Utility functions copied from anthropic_tools/run.py with attribution
-TRUNCATED_MESSAGE: str = "<response clipped><NOTE>To save on context only part of this file has been shown to you. You should retry this tool after you have searched inside the file with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>"
-MAX_RESPONSE_LEN: int = 16000
-
-
-def maybe_truncate(content: str, truncate_after: int | None = MAX_RESPONSE_LEN):
-    """Truncate content and append a notice if content exceeds the specified length."""
-    return (
-        content
-        if not truncate_after or len(content) <= truncate_after
-        else content[:truncate_after] + TRUNCATED_MESSAGE
-    )
-
-
-async def run(
-    cmd: str,
-    timeout: float | None = 120.0,  # seconds
-    truncate_after: int | None = MAX_RESPONSE_LEN,
-):
-    """Run a shell command asynchronously with a timeout."""
-    process = await asyncio.create_subprocess_shell(
-        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-
-    try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        return (
-            process.returncode or 0,
-            maybe_truncate(stdout.decode(), truncate_after=truncate_after),
-            maybe_truncate(stderr.decode(), truncate_after=truncate_after),
-        )
-    except asyncio.TimeoutError as exc:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        raise TimeoutError(
-            f"Command '{cmd}' timed out after {timeout} seconds"
-        ) from exc
-        
-        
-class MCPTool(Tool):
-    """
-    MCP implementation copying Tool from openai.types.chat.chat_completion_tool_union_param.
-    Allows using MCP tools with OpenAI API.
-    """
-    
-    def to_tool_param(self) -> ChatCompletionFunctionToolParam:
-        return ChatCompletionFunctionToolParam(
-            type="function",
-            function=FunctionDefinition(
-                name=self.name,
-                description=self.description,
-                parameters=self.inputSchema
-            )
-        )
-
-
-# Copied from anthropic_tools/bash.py with attribution
-class _BashSession:
-    """A session of a bash shell."""
-
-    _started: bool
-    _process: asyncio.subprocess.Process
-
-    command: str = "/bin/bash"
-    _output_delay: float = 0.2  # seconds
-    _timeout: float = 120.0  # seconds
-    _sentinel: str = "<<exit>>"
-
-    def __init__(self):
-        self._started = False
-        self._timed_out = False
-
-    async def start(self):
-        if self._started:
-            return
-
-        self._process = await asyncio.create_subprocess_shell(
-            self.command,
-            preexec_fn=os.setsid,
-            shell=True,
-            bufsize=0,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        self._started = True
-
-    def stop(self):
-        """Terminate the bash shell."""
-        if not self._started:
-            raise RuntimeError("Session has not started.")
-        if self._process.returncode is not None:
-            return
-        self._process.terminate()
-
-    async def run(self, command: str) -> Sequence[TextContent]:
-        """Execute a command in the bash shell."""
-        if not self._started:
-            raise RuntimeError("Session has not started.")
-        if self._process.returncode is not None:
-            return [
-                TextContent(type="text", text="tool must be restarted"),
-                TextContent(type="text", text=f"Error: bash has exited with returncode {self._process.returncode}")
-            ]
-        if self._timed_out:
-            raise RuntimeError(
-                f"timed out: bash has not returned in {self._timeout} seconds and must be restarted"
-            )
-
-        # we know these are not None because we created the process with PIPEs
-        assert self._process.stdin
-        assert self._process.stdout
-        assert self._process.stderr
-
-        # send command to the process
-        self._process.stdin.write(
-            command.encode() + f"; echo '{self._sentinel}'\n".encode()
-        )
-        await self._process.stdin.drain()
-
-        # read output from the process, until the sentinel is found
-        try:
-            async with asyncio.timeout(self._timeout):
-                while True:
-                    await asyncio.sleep(self._output_delay)
-                    # if we read directly from stdout/stderr, it will wait forever for
-                    # EOF. use the StreamReader buffer directly instead.
-                    output = self._process.stdout._buffer.decode()  # pyright: ignore[reportAttributeAccessIssue]
-                    if self._sentinel in output:
-                        # strip the sentinel and break
-                        output = output[: output.index(self._sentinel)]
-                        break
-        except asyncio.TimeoutError:
-            self._timed_out = True
-            raise RuntimeError(
-                f"timed out: bash has not returned in {self._timeout} seconds and must be restarted"
-            ) from None
-
-        if output.endswith("\n"):
-            output = output[:-1]
-
-        error = self._process.stderr._buffer.decode()  # pyright: ignore[reportAttributeAccessIssue]
-        if error.endswith("\n"):
-            error = error[:-1]
-
-        # clear the buffers so that the next output can be read correctly
-        self._process.stdout._buffer.clear()  # pyright: ignore[reportAttributeAccessIssue]
-        self._process.stderr._buffer.clear()  # pyright: ignore[reportAttributeAccessIssue]
-
-        contents = []
-        if output:
-            contents.append(TextContent(type="text", text=output))
-        if error:
-            contents.append(TextContent(type="text", text=f"Error: {error}"))
-
-        return contents if contents else [TextContent(type="text", text="Command executed successfully")]
-
-    
-
-class MCPBashTool(MCPTool):
-    """
-    MCP implementation copying BashTool20250124 from anthropic_tools.
-    Allows running bash commands with MCP protocol.
-    """
-    # Use PrivateAttr so Pydantic BaseModel allows this private state
-    _session: Any = PrivateAttr(default=None)
-
-    def __init__(self):
-        super().__init__(
-            name="bash",
-            description="Run bash commands. You can execute shell commands and get their output. Use 'restart: true' to start a new shell session.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The bash command to execute"
-                    },
-                    "restart": {
-                        "type": "boolean",
-                        "description": "Whether to restart the bash session",
-                        "default": False
-                    }
-                },
-                "required": []
-            }
-        )
-
-    async def execute(self, arguments: dict[str, Any]) -> Sequence[TextContent]:
-        """Execute bash command - copied from BashTool20250124"""
-        command = arguments.get("command")
-        restart = arguments.get("restart", False)
-
-        if restart:
-            if self._session:
-                self._session.stop()
-            self._session = _BashSession()
-            await self._session.start()
-
-            return [TextContent(type="text", text="tool has been restarted.")]
-
-        if self._session is None:
-            self._session = _BashSession()
-            await self._session.start()
-
-        if command is not None:
-            return await self._session.run(command)
-
-        raise ValueError("no command provided.")
-
+from .shared import MCPTool, maybe_truncate, run
+from pathlib import Path
+from collections import defaultdict
+from typing import get_args
+import shlex
 
 # Copied from anthropic_tools/edit.py with attribution
 Command_20250429 = Literal[
@@ -248,8 +25,10 @@ class MCPEditTool(MCPTool):
 
     # Private attribute to store file edit history across calls
     _file_history: dict[Path, list[str]] = PrivateAttr(default_factory=lambda: defaultdict(list))
+    _sandbox: Any | None = PrivateAttr(default=None)
+    _sandbox_root: str = PrivateAttr(default="/root/sandbox")
 
-    def __init__(self):
+    def __init__(self, sandbox: Any | None = None, sandbox_root: str = "/root/sandbox"):
         super().__init__(
             name="str_replace_editor",
             description="A tool for viewing, creating, and editing files. Supports viewing file contents, creating new files, replacing strings in files, and inserting text at specific lines.",
@@ -290,6 +69,8 @@ class MCPEditTool(MCPTool):
                 "required": ["command", "path"]
             }
         )
+        self._sandbox = sandbox
+        self._sandbox_root = sandbox_root
 
     async def execute(self, arguments: dict[str, Any]) -> Sequence[TextContent]:
         """Execute file editing operation - copied from EditTool20250429"""
@@ -330,47 +111,54 @@ class MCPEditTool(MCPTool):
         """
         Check that the path/command combination is valid.
         """
-        # Check if its an absolute path
+        # Require absolute paths to avoid ambiguity.
         if not path.is_absolute():
             suggested_path = Path("") / path
             raise ValueError(
                 f"The path {path} is not an absolute path, it should start with `/`. Maybe you meant {suggested_path}?"
             )
-        # Check if path exists
-        if not path.exists() and command != "create":
+
+        exists = self._exists(path)
+        is_dir = self._is_dir(path) if exists else False
+
+        if not exists and command != "create":
             raise ValueError(
                 f"The path {path} does not exist. Please provide a valid path."
             )
-        if path.exists() and command == "create":
+        if exists and command == "create":
             raise ValueError(
                 f"File already exists at: {path}. Cannot overwrite files using command `create`."
             )
-        # Check if the path points to a directory
-        if path.is_dir():
-            if command != "view":
-                raise ValueError(
-                    f"The path {path} is a directory and only the `view` command can be used on directories"
-                )
+        if is_dir and command != "view":
+            raise ValueError(
+                f"The path {path} is a directory and only the `view` command can be used on directories"
+            )
 
     async def view(self, path: Path, view_range: list[int] | None = None) -> Sequence[TextContent]:
         """Implement the view command"""
-        if path.is_dir():
+        # Directory listing
+        if self._is_dir(path):
             if view_range:
                 raise ValueError(
                     "The `view_range` parameter is not allowed when `path` points to a directory."
                 )
 
-            _, stdout, stderr = await run(
-                rf"find {path} -maxdepth 2 -not -path '*/\.*'"
-            )
-            contents = []
-            if stdout or stderr:
-                if not stderr:
-                    stdout = f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{stdout}\n"
-                contents.append(TextContent(type="text", text=stdout))
-                if stderr:
-                    contents.append(TextContent(type="text", text=f"Error: {stderr}"))
-            return contents
+            if self._sandbox is None:
+                _, stdout, stderr = await run(
+                    rf"find {path} -maxdepth 2 -not -path '*/\.*'"
+                )
+                contents = []
+                if stdout or stderr:
+                    if not stderr:
+                        stdout = f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{stdout}\n"
+                    contents.append(TextContent(type="text", text=stdout))
+                    if stderr:
+                        contents.append(TextContent(type="text", text=f"Error: {stderr}"))
+                return contents
+            else:
+                out = self._sb_run(rf"find {shlex.quote(str(path))} -maxdepth 2 -not -path '*/\.*'")
+                stdout = out.strip()
+                return [TextContent(type="text", text=f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{stdout}\n")]
 
         file_content = self.read_file(path)
         init_line = 1
@@ -496,17 +284,31 @@ class MCPEditTool(MCPTool):
 
     def read_file(self, path: Path) -> str:
         """Read the content of a file from a given path; raise an exception if an error occurs."""
-        try:
-            return path.read_text()
-        except Exception as e:
-            raise RuntimeError(f"Ran into {e} while trying to read {path}") from e
+        if self._sandbox is None:
+            try:
+                return path.read_text()
+            except Exception as e:
+                raise RuntimeError(f"Ran into {e} while trying to read {path}") from e
+        else:
+            try:
+                return self._sb_run(f"cat {shlex.quote(str(path))}")
+            except Exception as e:
+                raise RuntimeError(f"Ran into {e} while trying to read {path} in sandbox") from e
 
     def write_file(self, path: Path, file: str):
         """Write the content of a file to a given path; raise an exception if an error occurs."""
-        try:
-            path.write_text(file)
-        except Exception as e:
-            raise RuntimeError(f"Ran into {e} while trying to write to {path}") from e
+        if self._sandbox is None:
+            try:
+                path.write_text(file)
+            except Exception as e:
+                raise RuntimeError(f"Ran into {e} while trying to write to {path}") from e
+        else:
+            try:
+                # Use a single-quoted heredoc to avoid interpolation issues
+                heredoc = f"cat > {shlex.quote(str(path))} << 'EOF'\n{file}\nEOF"
+                self._sb_run(heredoc)
+            except Exception as e:
+                raise RuntimeError(f"Ran into {e} while trying to write to {path} in sandbox") from e
 
     def _make_output(
         self,
@@ -530,3 +332,36 @@ class MCPEditTool(MCPTool):
             + file_content
             + "\n"
         )
+
+    # --- Helpers for Modal sandbox integration ---
+    def _sb_run(self, cmd: str) -> str:
+        """Run a command inside the provided sandbox and return stdout as text."""
+        if self._sandbox is None:
+            raise RuntimeError("Sandbox not configured")
+        # Prefix with cd to sandbox root for consistency
+        full_cmd = f"cd {shlex.quote(self._sandbox_root)} && {cmd}; echo '<<exit>>'"
+        p = self._sandbox.exec("bash", "-lc", full_cmd, bufsize=1)
+        sentinel = "<<exit>>"
+        out_chunks: list[str] = []
+        for line in p.stdout:
+            s = line.decode() if isinstance(line, (bytes, bytearray)) else str(line)
+            if sentinel in s:
+                s = s.split(sentinel)[0]
+                if s:
+                    out_chunks.append(s)
+                break
+            out_chunks.append(s)
+        p.wait()
+        return "".join(out_chunks)
+
+    def _exists(self, path: Path) -> bool:
+        if self._sandbox is None:
+            return path.exists()
+        out = self._sb_run(f"if test -e {shlex.quote(str(path))}; then echo yes; else echo no; fi")
+        return out.strip().endswith("yes")
+
+    def _is_dir(self, path: Path) -> bool:
+        if self._sandbox is None:
+            return path.is_dir()
+        out = self._sb_run(f"if test -d {shlex.quote(str(path))}; then echo yes; else echo no; fi")
+        return out.strip().endswith("yes")
