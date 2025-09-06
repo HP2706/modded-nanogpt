@@ -62,6 +62,12 @@ async def main():
         async with ClientSession(read, write) as session:
             await session.initialize()
 
+            # 0) Ensure no stale file remains from a previous run
+            _ = await session.call_tool(
+                "bash",
+                {"command": f"rm -f {target_path}"},
+            )
+
             # 1) Create the training script file in the sandbox
             create_res = await session.call_tool(
                 "str_replace_editor",
@@ -76,17 +82,34 @@ async def main():
             )
             print("View result:", view_res)
 
-            # 3) Train by running the script inside the Modal bash session
-            # The Modal bash tool starts in /root/sandbox, so we can either run
-            #   python train_tiny.py
-            # or use an absolute path
-            run_res = await session.call_tool(
+            # 3) Start training in the background (unbuffered python) and peek logs every 5 seconds
+            start_res = await session.call_tool(
                 "bash",
-                {"command": "python train_tiny.py"},
+                {"command": "python -u train_tiny.py", "background": True, "name": "tiny-train"},
             )
-            print("Run result:", run_res)
+            print("Start result:", start_res)
+
+            # Peek and poll a few times
+            for i in range(5):
+                await asyncio.sleep(5)
+                peek_res = await session.call_tool(
+                    "bash",
+                    {"peek": True, "name": "tiny-train", "lines": 50},
+                )
+                print(f"Peek {i+1}:", peek_res)
+                poll_res = await session.call_tool(
+                    "bash",
+                    {"poll": True, "name": "tiny-train"},
+                )
+                print(f"Poll {i+1}:", poll_res)
+
+            # Optionally stop the job (training script will exit on its own soon)
+            stop_res = await session.call_tool(
+                "bash",
+                {"stop": True, "name": "tiny-train"},
+            )
+            print("Stop result:", stop_res)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-

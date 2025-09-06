@@ -6,6 +6,7 @@ from pydantic import PrivateAttr
 from .shared import MCPTool
 import sys
 import shlex
+from typing import Dict
 
 # if on macos we infer we are local and use the current directory
 if sys.platform == "darwin":
@@ -214,6 +215,7 @@ class MCPBashTool(MCPTool):
     _session: Any = PrivateAttr(default=None)
     _sandbox: Any = PrivateAttr(default=None)
     _modal_session: Any = PrivateAttr(default=None)
+    _jobs: Dict[str, Dict[str, Any]] = PrivateAttr(default_factory=dict)
 
     def __init__(self, automount_path: str = automount_path, sandbox: Any | None = None, sandbox_root: str = "/root/sandbox"):
         super().__init__(
@@ -222,6 +224,7 @@ class MCPBashTool(MCPTool):
             Run bash commands. You can execute shell commands and get their output. 
             Use 'restart: true' to start a new shell session.
             Runs locally by default at {automount_path}. If a Modal Sandbox is provided at construction time, commands run inside it under {sandbox_root}.
+            Background jobs: set 'background: true' with a 'name' to start a job whose logs are written under .mcp_logs. Use 'peek: true, name, lines' to view logs, 'poll: true, name' to get RUNNING/STOPPED, 'list_jobs: true' to list jobs, and 'stop: true, name' to stop.
             """,
             inputSchema={
                 "type": "object",
@@ -233,6 +236,40 @@ class MCPBashTool(MCPTool):
                     "restart": {
                         "type": "boolean",
                         "description": "Whether to restart the bash session",
+                        "default": False
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run the command as a background job and return immediately",
+                        "default": False
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Job name for background, peek, or stop"
+                    },
+                    "peek": {
+                        "type": "boolean",
+                        "description": "Peek logs for a named background job",
+                        "default": False
+                    },
+                    "stop": {
+                        "type": "boolean",
+                        "description": "Stop a named background job",
+                        "default": False
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of log lines to show when peeking",
+                        "default": 100
+                    },
+                    "list_jobs": {
+                        "type": "boolean",
+                        "description": "List background jobs tracked by this session",
+                        "default": False
+                    },
+                    "poll": {
+                        "type": "boolean",
+                        "description": "Poll status (RUNNING/STOPPED) for a named background job",
                         "default": False
                     }
                 },
@@ -247,6 +284,13 @@ class MCPBashTool(MCPTool):
         """Execute bash command - copied from BashTool20250124"""
         command = arguments.get("command")
         restart = arguments.get("restart", False)
+        background = arguments.get("background", False)
+        peek = arguments.get("peek", False)
+        stop = arguments.get("stop", False)
+        name = arguments.get("name")
+        lines = int(arguments.get("lines", 100))
+        list_jobs = arguments.get("list_jobs", False)
+        poll = arguments.get("poll", False)
 
         # If a sandbox was provided, run commands inside Modal in a stateful session
         if self._sandbox is not None:
@@ -260,6 +304,82 @@ class MCPBashTool(MCPTool):
             if self._modal_session is None:
                 self._modal_session = _ModalBashSession(self._sandbox, root=self._sandbox_root)
                 await self._modal_session.start()
+
+            # Handle background/list/peek/stop/poll controls (Modal)
+            logs_dir = f"{self._sandbox_root}/.mcp_logs"
+
+            if list_jobs:
+                if not self._jobs:
+                    return [TextContent(type="text", text="No background jobs.")]
+                lines_out: list[str] = []
+                for jname, job in self._jobs.items():
+                    pid = job.get("pid", -1)
+                    logf = job.get("log", "")
+                    out = await self._modal_session.run(f"kill -0 {pid} >/dev/null 2>&1; echo $?")
+                    text = "\n".join(c.text for c in out if hasattr(c, 'text')).strip()
+                    code = text.splitlines()[-1] if text else "1"
+                    status = "RUNNING" if code == "0" else "STOPPED"
+                    lines_out.append(f"- {jname}: {status} (pid {pid}) log: {logf}")
+                return [TextContent(type="text", text="\n".join(lines_out))]
+
+            if background:
+                if not command:
+                    raise ValueError("background requires a 'command'")
+                if not name:
+                    raise ValueError("background requires a 'name'")
+                log_file = f"{logs_dir}/{name}.log"
+                start_cmd = (
+                    f"mkdir -p {shlex.quote(logs_dir)} && "
+                    f"nohup bash -lc {shlex.quote(command)} > {shlex.quote(log_file)} 2>&1 & echo $!"
+                )
+                out = await self._modal_session.run(start_cmd)
+                # Combine output texts
+                text = "\n".join(c.text for c in out if hasattr(c, 'text'))
+                pid_line = text.strip().splitlines()[-1] if text.strip() else ""
+                try:
+                    pid = int(pid_line)
+                except Exception:
+                    pid = -1
+                self._jobs[name] = {"pid": pid, "log": log_file}
+                msg = (
+                    f"Started job '{name}' pid {pid}. Logs: {log_file}.\n"
+                    "This process is running in the background. You can:\n"
+                    f"- peek logs: {{'peek': true, 'name': '{name}', 'lines': 100}}\n"
+                    f"- poll status: {{'poll': true, 'name': '{name}'}}\n"
+                    f"- stop job: {{'stop': true, 'name': '{name}'}}\n"
+                    f"- list jobs: {{'list_jobs': true}}"
+                )
+                return [TextContent(type="text", text=msg)]
+
+            if peek:
+                if not name:
+                    raise ValueError("peek requires a 'name'")
+                job = self._jobs.get(name)
+                if not job:
+                    raise ValueError(f"unknown job '{name}'")
+                out = await self._modal_session.run(f"tail -n {lines} {shlex.quote(job['log'])}")
+                return out
+
+            if stop:
+                if not name:
+                    raise ValueError("stop requires a 'name'")
+                job = self._jobs.get(name)
+                if not job:
+                    raise ValueError(f"unknown job '{name}'")
+                await self._modal_session.run(f"kill {job['pid']} || true")
+                return [TextContent(type="text", text=f"stopped job '{name}' (pid {job['pid']})")]
+
+            if poll:
+                if not name:
+                    raise ValueError("poll requires a 'name'")
+                job = self._jobs.get(name)
+                if not job:
+                    raise ValueError(f"unknown job '{name}'")
+                out = await self._modal_session.run(f"kill -0 {job['pid']} >/dev/null 2>&1; echo $?")
+                text = "\n".join(c.text for c in out if hasattr(c, 'text')).strip()
+                code = text.splitlines()[-1] if text else "1"
+                status = "RUNNING" if code == "0" else "STOPPED"
+                return [TextContent(type="text", text=f"{name}: {status} (pid {job['pid']})")]
 
             if command is not None:
                 return await self._modal_session.run(command)
@@ -276,6 +396,80 @@ class MCPBashTool(MCPTool):
         if self._session is None:
             self._session = _BashSession(automount_path=self._automount_path)
             await self._session.start()
+
+        # Background/list/peek/stop/poll for local mode
+        logs_dir = os.path.join(self._automount_path, ".mcp_logs")
+        if list_jobs:
+            if not self._jobs:
+                return [TextContent(type="text", text="No background jobs.")]
+            lines_out: list[str] = []
+            for jname, job in self._jobs.items():
+                pid = job.get("pid", -1)
+                logf = job.get("log", "")
+                out = await self._session.run(f"kill -0 {pid} >/dev/null 2>&1; echo $?")
+                text = "\n".join(c.text for c in out if hasattr(c, 'text')).strip()
+                code = text.splitlines()[-1] if text else "1"
+                status = "RUNNING" if code == "0" else "STOPPED"
+                lines_out.append(f"- {jname}: {status} (pid {pid}) log: {logf}")
+            return [TextContent(type="text", text="\n".join(lines_out))]
+        if background:
+            if not command:
+                raise ValueError("background requires a 'command'")
+            if not name:
+                raise ValueError("background requires a 'name'")
+            os.makedirs(logs_dir, exist_ok=True)
+            log_file = os.path.join(logs_dir, f"{name}.log")
+            start_cmd = (
+                f"mkdir -p {shlex.quote(logs_dir)} && "
+                f"nohup bash -lc {shlex.quote(command)} > {shlex.quote(log_file)} 2>&1 & echo $!"
+            )
+            out = await self._session.run(start_cmd)
+            text = "\n".join(c.text for c in out if hasattr(c, 'text'))
+            pid_line = text.strip().splitlines()[-1] if text.strip() else ""
+            try:
+                pid = int(pid_line)
+            except Exception:
+                pid = -1
+            self._jobs[name] = {"pid": pid, "log": log_file}
+            msg = (
+                f"Started job '{name}' pid {pid}. Logs: {log_file}.\n"
+                "This process is running in the background. You can:\n"
+                f"- peek logs: {{'peek': true, 'name': '{name}', 'lines': 100}}\n"
+                f"- poll status: {{'poll': true, 'name': '{name}'}}\n"
+                f"- stop job: {{'stop': true, 'name': '{name}'}}\n"
+                f"- list jobs: {{'list_jobs': true}}"
+            )
+            return [TextContent(type="text", text=msg)]
+
+        if peek:
+            if not name:
+                raise ValueError("peek requires a 'name'")
+            job = self._jobs.get(name)
+            if not job:
+                raise ValueError(f"unknown job '{name}'")
+            out = await self._session.run(f"tail -n {lines} {shlex.quote(job['log'])}")
+            return out
+
+        if stop:
+            if not name:
+                raise ValueError("stop requires a 'name'")
+            job = self._jobs.get(name)
+            if not job:
+                raise ValueError(f"unknown job '{name}'")
+            await self._session.run(f"kill {job['pid']} || true")
+            return [TextContent(type="text", text=f"stopped job '{name}' (pid {job['pid']})")]
+
+        if poll:
+            if not name:
+                raise ValueError("poll requires a 'name'")
+            job = self._jobs.get(name)
+            if not job:
+                raise ValueError(f"unknown job '{name}'")
+            out = await self._session.run(f"kill -0 {job['pid']} >/dev/null 2>&1; echo $?")
+            text = "\n".join(c.text for c in out if hasattr(c, 'text')).strip()
+            code = text.splitlines()[-1] if text else "1"
+            status = "RUNNING" if code == "0" else "STOPPED"
+            return [TextContent(type="text", text=f"{name}: {status} (pid {job['pid']})")]
 
         if command is not None:
             return await self._session.run(command)

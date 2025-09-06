@@ -304,8 +304,8 @@ class MCPEditTool(MCPTool):
                 raise RuntimeError(f"Ran into {e} while trying to write to {path}") from e
         else:
             try:
-                # Use a single-quoted heredoc to avoid interpolation issues
-                heredoc = f"cat > {shlex.quote(str(path))} << 'EOF'\n{file}\nEOF"
+                # Use a single-quoted heredoc to avoid interpolation issues and ensure EOF is on its own line
+                heredoc = f"cat > {shlex.quote(str(path))} << 'EOF'\n{file}\nEOF\n"
                 self._sb_run(heredoc)
             except Exception as e:
                 raise RuntimeError(f"Ran into {e} while trying to write to {path} in sandbox") from e
