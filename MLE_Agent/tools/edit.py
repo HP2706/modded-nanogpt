@@ -1,7 +1,6 @@
-from typing import Any, Literal, Sequence
-from mcp.types import TextContent
-from pydantic import PrivateAttr
-from .shared import MCPTool, maybe_truncate, run
+from typing import Any, Literal, Annotated
+from pydantic import Field
+from .shared import maybe_truncate, run
 from pathlib import Path
 from collections import defaultdict
 from typing import get_args
@@ -17,94 +16,47 @@ Command_20250429 = Literal[
 SNIPPET_LINES: int = 4
 
 
-class MCPEditTool(MCPTool):
-    """
-    MCP implementation copying EditTool20250429 from anthropic_tools.
-    Allows viewing, creating, editing files with MCP protocol.
-    """
-
-    # Private attribute to store file edit history across calls
-    _file_history: dict[Path, list[str]] = PrivateAttr(default_factory=lambda: defaultdict(list))
-    _sandbox: Any | None = PrivateAttr(default=None)
-    _sandbox_root: str = PrivateAttr(default="/root/sandbox")
+class EditContainer:
+    """Stateful file edit container supporting view, create, str_replace, and insert."""
 
     def __init__(self, sandbox: Any | None = None, sandbox_root: str = "/root/sandbox"):
-        super().__init__(
-            name="str_replace_editor",
-            description="A tool for viewing, creating, and editing files. Supports viewing file contents, creating new files, replacing strings in files, and inserting text at specific lines.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "enum": ["view", "create", "str_replace", "insert"],
-                        "description": "The operation to perform on the file"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute path to the file to operate on"
-                    },
-                    "file_text": {
-                        "type": "string",
-                        "description": "Content for file creation (required for create command)"
-                    },
-                    "view_range": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Range of lines to view [start, end] (for view command)"
-                    },
-                    "old_str": {
-                        "type": "string",
-                        "description": "String to replace (required for str_replace command)"
-                    },
-                    "new_str": {
-                        "type": "string",
-                        "description": "String to replace with (for str_replace and insert commands)"
-                    },
-                    "insert_line": {
-                        "type": "integer",
-                        "description": "Line number to insert at (required for insert command)"
-                    }
-                },
-                "required": ["command", "path"]
-            }
-        )
-        self._sandbox = sandbox
-        self._sandbox_root = sandbox_root
+        # Track history per file
+        self._file_history: dict[Path, list[str]] = defaultdict(list)
+        self._sandbox: Any | None = sandbox
+        self._sandbox_root: str = sandbox_root
 
-    async def execute(self, arguments: dict[str, Any]) -> Sequence[TextContent]:
-        """Execute file editing operation - copied from EditTool20250429"""
-        command = arguments.get("command")
-        path = arguments.get("path")
-        file_text = arguments.get("file_text")
-        view_range = arguments.get("view_range")
-        old_str = arguments.get("old_str")
-        new_str = arguments.get("new_str")
-        insert_line = arguments.get("insert_line")
-
+    async def str_replace_editor(
+        self,
+        command: Annotated[Literal["view", "create", "str_replace", "insert"], Field(description="The operation to perform: view, create, str_replace, or insert")],
+        path: Annotated[str, Field(description="Absolute path to the file (or directory for view)")],
+        file_text: Annotated[str | None, Field(description="File content to create (required for create)")]=None,
+        view_range: Annotated[list[int] | None, Field(description="Range of lines to view [start, end]; use -1 as end")]=None,
+        old_str: Annotated[str | None, Field(description="String to replace (required for str_replace)")]=None,
+        new_str: Annotated[str | None, Field(description="Replacement string (for str_replace and insert)")]=None,
+        insert_line: Annotated[int | None, Field(description="Line number to insert at (required for insert)")]=None,
+    ) -> str:
         _path = Path(path)
         self.validate_path(command, _path)
         if command == "view":
-            return await self.view(_path, view_range)
-        elif command == "create":
+            return await self._view(_path, view_range)
+        if command == "create":
             if file_text is None:
                 raise ValueError("Parameter `file_text` is required for command: create")
             self.write_file(_path, file_text)
             self._file_history[_path].append(file_text)
-            return [TextContent(type="text", text=f"File created successfully at: {_path}")]
-        elif command == "str_replace":
+            return f"File created successfully at: {_path}"
+        if command == "str_replace":
             if old_str is None:
                 raise ValueError("Parameter `old_str` is required for command: str_replace")
-            return self.str_replace(_path, old_str, new_str)
-        elif command == "insert":
+            return self._str_replace(_path, old_str, new_str)
+        if command == "insert":
             if insert_line is None:
                 raise ValueError("Parameter `insert_line` is required for command: insert")
             if new_str is None:
                 raise ValueError("Parameter `new_str` is required for command: insert")
-            return self.insert(_path, insert_line, new_str)
-        # Note: undo_edit command was removed in this version
+            return self._insert(_path, insert_line, new_str)
         raise ValueError(
-            f'Unrecognized command {command}. The allowed commands for the {self.name} tool are: {", ".join(get_args(Command_20250429))}'
+            f"Unrecognized command {command}. Allowed: {', '.join(get_args(Command_20250429))}"
         )
 
     def validate_path(self, command: str, path: Path):
@@ -134,8 +86,8 @@ class MCPEditTool(MCPTool):
                 f"The path {path} is a directory and only the `view` command can be used on directories"
             )
 
-    async def view(self, path: Path, view_range: list[int] | None = None) -> Sequence[TextContent]:
-        """Implement the view command"""
+    async def _view(self, path: Path, view_range: list[int] | None = None) -> str:
+        """Implement the view command; returns formatted text."""
         # Directory listing
         if self._is_dir(path):
             if view_range:
@@ -147,18 +99,16 @@ class MCPEditTool(MCPTool):
                 _, stdout, stderr = await run(
                     rf"find {path} -maxdepth 2 -not -path '*/\.*'"
                 )
-                contents = []
-                if stdout or stderr:
-                    if not stderr:
-                        stdout = f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{stdout}\n"
-                    contents.append(TextContent(type="text", text=stdout))
-                    if stderr:
-                        contents.append(TextContent(type="text", text=f"Error: {stderr}"))
-                return contents
+                msg = ""
+                if stdout and not stderr:
+                    msg = f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{stdout}\n"
+                elif stderr:
+                    msg = f"Error: {stderr}"
+                return msg or ""
             else:
                 out = self._sb_run(rf"find {shlex.quote(str(path))} -maxdepth 2 -not -path '*/\.*'")
                 stdout = out.strip()
-                return [TextContent(type="text", text=f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{stdout}\n")]
+                return f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{stdout}\n"
 
         file_content = self.read_file(path)
         init_line = 1
@@ -188,12 +138,9 @@ class MCPEditTool(MCPTool):
             else:
                 file_content = "\n".join(file_lines[init_line - 1 : final_line])
 
-        return [TextContent(
-            type="text",
-            text=self._make_output(file_content, str(path), init_line=init_line)
-        )]
+        return self._make_output(file_content, str(path), init_line=init_line)
 
-    def str_replace(self, path: Path, old_str: str, new_str: str | None) -> Sequence[TextContent]:
+    def _str_replace(self, path: Path, old_str: str, new_str: str | None) -> str:
         """Implement the str_replace command, which replaces old_str with new_str in the file content"""
         # Read the file content
         file_content = self.read_file(path).expandtabs()
@@ -239,9 +186,9 @@ class MCPEditTool(MCPTool):
         )
         success_msg += "Review the changes and make sure they are as expected. Edit the file again if necessary."
 
-        return [TextContent(type="text", text=success_msg)]
+        return success_msg
 
-    def insert(self, path: Path, insert_line: int, new_str: str) -> Sequence[TextContent]:
+    def _insert(self, path: Path, insert_line: int, new_str: str) -> str:
         """Implement the insert command, which inserts new_str at the specified line in the file content."""
         file_text = self.read_file(path).expandtabs()
         new_str = new_str.expandtabs()
@@ -278,7 +225,7 @@ class MCPEditTool(MCPTool):
             max(1, insert_line - SNIPPET_LINES + 1),
         )
         success_msg += "Review the changes and make sure they are as expected (correct indentation, no duplicate lines, etc). Edit the file again if necessary."
-        return [TextContent(type="text", text=success_msg)]
+        return success_msg
 
     # Note: undo_edit method is not implemented in this version as it was removed
 

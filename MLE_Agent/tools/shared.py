@@ -1,11 +1,12 @@
 # tools for reading, writing, applying code edits..
 # This file contains MCP implementations that copy code from anthropic_tools with proper attribution
 # Using only MCP types and standard Python types, no external tool framework dependencies
-from openai.types.shared_params.function_definition import FunctionDefinition
-from openai.types.chat.chat_completion_tool_union_param import ChatCompletionFunctionToolParam
 import asyncio
 import logging
-from mcp.types import Tool
+from modal import Volume
+
+agent_volume = Volume.from_name("mle-agent-volume", create_if_missing=True)
+fineweb10B_volume = Volume.from_name("fineweb10B", create_if_missing=True)
 
 logger = logging.getLogger(__name__)
 
@@ -50,19 +51,3 @@ async def run(
         ) from exc
         
         
-class MCPTool(Tool):
-    """
-    MCP implementation copying Tool from openai.types.chat.chat_completion_tool_union_param.
-    Allows using MCP tools with OpenAI API.
-    """
-    
-    def to_tool_param(self) -> ChatCompletionFunctionToolParam:
-        return ChatCompletionFunctionToolParam(
-            type="function",
-            function=FunctionDefinition(
-                name=self.name,
-                description=self.description,
-                parameters=self.inputSchema
-            )
-        )
-
