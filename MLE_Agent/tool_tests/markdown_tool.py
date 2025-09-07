@@ -8,6 +8,7 @@ print(sys.path)
 
 from tools.format_tool import format_print_tool
 from mcp_server import mcp_app
+
 async def main():
     os.environ["USE_MODAL_SANDBOX"] = "1"
     async with Client(mcp_app) as client:
