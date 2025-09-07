@@ -6,7 +6,7 @@ import time
 import subprocess
 from pathlib import Path
 
-agent_volume = Volume.from_name("mle-agent-volume", create_if_missing=True)
+agent_volume = Volume.from_name("mle-sandbox", create_if_missing=True)
 # Use a dedicated Modal app for PDF functionality to avoid conflicts with
 # any concurrently running app (e.g., the Modal Sandbox in mcp_server).
 # Defining a fresh App here also ensures proper hydration for @app.function
