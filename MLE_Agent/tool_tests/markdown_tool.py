@@ -5,7 +5,6 @@ import sys
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
 print(sys.path)
-
 from tools.format_tool import format_print_tool
 from mcp_server import mcp_app
 

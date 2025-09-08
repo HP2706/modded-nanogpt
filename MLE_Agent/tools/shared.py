@@ -5,7 +5,7 @@ import asyncio
 import logging
 from modal import Volume
 
-agent_volume = Volume.from_name("mle-agent-volume", create_if_missing=True)
+agent_volume = Volume.from_name("mle-sandbox", create_if_missing=True)
 fineweb10B_volume = Volume.from_name("fineweb10B", create_if_missing=True)
 
 logger = logging.getLogger(__name__)

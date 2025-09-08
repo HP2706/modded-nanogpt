@@ -5,10 +5,7 @@ Preserves Modal Sandbox support (USE_MODAL_SANDBOX=1) and tool names.
 
 import os
 import logging
-from typing import Any
-
 from fastmcp import FastMCP
-
 from tools.bash import BashContainer
 from tools.edit import EditContainer
 from tools.pdf import PdfContainer
