@@ -32,13 +32,16 @@ class _BashSession:
     _timeout: float = 120.0  # seconds
     _sentinel: str = "<<exit>>"
 
-    def __init__(self, automount_path: str = automount_path):
+    def __init__(self, automount_path: str = automount_path, run_dir: str | None = None):
         print("tool is using automount path:", automount_path)
         self._started = False
         self._timed_out = False
         self._automount_path = automount_path
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
-        self._run_dir = os.path.join(self._automount_path, "runs", ts)
+        if run_dir:
+            self._run_dir = run_dir
+        else:
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+            self._run_dir = os.path.join(self._automount_path, "runs", ts)
 
     async def start(self):
         if self._started:
@@ -153,16 +156,20 @@ class _ModalBashSession:
     _timeout: float = 120.0  # seconds
 
     def __init__(
-        self, 
-        sandbox: Any, 
-        root: str = "/root/sandbox"
+        self,
+        sandbox: Any,
+        root: str = "/root/sandbox",
+        run_dir: str | None = None,
     ):
         self._sandbox = sandbox
         self._root = root
         self._started = False
         self._timed_out = False
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
-        self._run_dir = f"{self._root}/runs/{ts}"
+        if run_dir:
+            self._run_dir = run_dir
+        else:
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+            self._run_dir = f"{self._root}/runs/{ts}"
         
         self._prefix_cmd = f'cd {self._run_dir}'
         self._started = False
@@ -173,8 +180,8 @@ class _ModalBashSession:
         
         setup_cmd = (
             f"mkdir -p {self._run_dir} && "
-            f"cp /root/sandbox/modded-nanogpt.py {(self._run_dir)}"
-        )
+            f"cp -n /root/sandbox/modded-nanogpt.py {(self._run_dir)} || true"
+        ) # cp -n means copy only if the file does not exist
 
         _p = self._sandbox.exec(
             "bash",
@@ -224,14 +231,16 @@ class BashContainer:
     """
     _session: _ModalBashSession | _BashSession
     def __init__(
-        self, 
-        sandbox: LazySandBox | None = None, 
-        automount_path: str = '/root/sandbox', 
+        self,
+        sandbox: LazySandBox | None = None,
+        automount_path: str = '/root/sandbox',
+        run_dir: str | None = None,
     ):
+        self._sandbox = sandbox
         if sandbox is not None:
-            self._session = _ModalBashSession(sandbox, root=automount_path)
+            self._session = _ModalBashSession(sandbox, root=automount_path, run_dir=run_dir)
         else:
-            self._session = _BashSession(automount_path=automount_path)
+            self._session = _BashSession(automount_path=automount_path, run_dir=run_dir)
         
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._sandbox_root = automount_path
@@ -244,12 +253,18 @@ class BashContainer:
 
     async def restart_session(
         self,
-        ctx: Annotated[Context | None, Field(description="Optional context for debugging")] = None
+        ctx: Annotated[Context | None, Field(description="Optional context for debugging")] = None,
+        run_dir: Annotated[str | None, Field(description="Optional existing run directory to reuse instead of creating a new one")] = None,
     ) -> str:
-        """Restart the bash session with a new run directory."""
+        """Restart the bash session. If run_dir is provided, reuse it; otherwise create a new timestamped run dir."""
         ctx.debug("restarting bash session") if ctx else None
+        # Stop isn't strictly necessary since we start a fresh session object
+        # Create new session with optional run_dir
+        if isinstance(self._session, _ModalBashSession):
+            self._session = _ModalBashSession(self._sandbox, root=self._sandbox_root, run_dir=run_dir)
+        else:
+            self._session = _BashSession(automount_path=self._automount_path, run_dir=run_dir)
         await self._session.start()
-        self._session = _ModalBashSession(self._sandbox, root=self._sandbox_root)
         return f"tool has been restarted. cwd: {self._session._run_dir}"
 
     async def list_jobs(self) -> Annotated[str, Field(description="List of all background jobs with their status")]:

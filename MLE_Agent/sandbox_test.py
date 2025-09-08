@@ -57,6 +57,8 @@ def test_sandbox():
     _process.wait()
 
     sb.terminate()
+    
+    sb.reload_volumes()
 
     
 

@@ -7,6 +7,8 @@ import os
 import logging
 import asyncio
 from fastmcp import FastMCP
+from typing import Annotated
+from pydantic import Field
 from tools.bash import BashContainer
 from tools.edit import EditContainer
 from tools.pdf import PdfContainer
@@ -21,8 +23,9 @@ mcp_app = FastMCP("modal-server")
 _use_modal = os.environ.get("USE_MODAL_SANDBOX", "1") == "1"  # default to true
 _shared_sandbox = None
 
+
 if _use_modal:
-    
+    # if we are not providing a run dir, we need to upload the modded-nanogpt.py file
     with agent_volume.batch_upload(force=True) as batch:
         assert os.path.exists("modded-nanogpt.py"), "modded-nanogpt.py not found"
         batch.put_file("modded-nanogpt.py", "modded-nanogpt.py") 
@@ -60,19 +63,27 @@ if _use_modal:
         _shared_sandbox = None
         
 
+_run_dir_env = os.environ.get("RUN_DIR")
 
-
-_bash_state = BashContainer(sandbox=_shared_sandbox) if _shared_sandbox else BashContainer()
+_bash_state = (
+    BashContainer(sandbox=_shared_sandbox, automount_path="/root/sandbox", run_dir=_run_dir_env)
+    if _shared_sandbox
+    else BashContainer(run_dir=_run_dir_env)
+)
 
 async def get_automount_path():
     return await _bash_state.ensure_cwd()
 
 automount_path = asyncio.run(get_automount_path())
 
-_edit_state = EditContainer(
-    sandbox=_shared_sandbox,
-    automount_path=automount_path
-) if _shared_sandbox else EditContainer()
+_edit_state = (
+    EditContainer(
+        sandbox=_shared_sandbox,
+        automount_path=automount_path,
+    )
+    if _shared_sandbox
+    else EditContainer(automount_path=automount_path)
+)
 
 _pdf_state = PdfContainer(
     bash_container=_bash_state, 
@@ -97,6 +108,7 @@ mcp_app.tool(_edit_state.read_file)
 mcp_app.tool(_edit_state.write_file)
 
 mcp_app.tool(_pdf_state.pdf_to_markdown)
+
 
 if __name__ == "__main__":
     # Default to stdio transport; FastMCP CLI can also run this script directly
