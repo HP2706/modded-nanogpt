@@ -13,6 +13,7 @@ from tools.bash import BashContainer
 from tools.edit import EditContainer
 from tools.pdf import PdfContainer
 from tools.shared import agent_volume, fineweb10B_volume, LazySandBox
+from tools.memory import MemoryContainer
 import modal
 
 logger = logging.getLogger(__name__)
@@ -63,8 +64,7 @@ if _use_modal:
         _shared_sandbox = None
         
 
-_run_dir_env = os.environ.get("RUN_DIR")
-
+_run_dir_env = os.environ.get("RUN_DIR") or os.environ.get("DEMO_RUN_DIR")
 _bash_state = (
     BashContainer(sandbox=_shared_sandbox, automount_path="/root/sandbox", run_dir=_run_dir_env)
     if _shared_sandbox
@@ -91,6 +91,19 @@ _pdf_state = PdfContainer(
     shared_sandbox=_shared_sandbox
 )
 
+_memory_state = (
+    MemoryContainer(
+        sandbox=_shared_sandbox,
+        automount_path=automount_path,
+    )
+    if _shared_sandbox
+    else MemoryContainer(
+        automount_path=automount_path,
+    )
+)
+
+
+
 # Register object methods directly so they can share state
 # bash tools
 mcp_app.tool(_bash_state.run_command)
@@ -108,6 +121,17 @@ mcp_app.tool(_edit_state.read_file)
 mcp_app.tool(_edit_state.write_file)
 
 mcp_app.tool(_pdf_state.pdf_to_markdown)
+
+# memory tools
+mcp_app.tool(_memory_state.read_graph)
+mcp_app.tool(_memory_state.create_entities)
+mcp_app.tool(_memory_state.create_relations)
+mcp_app.tool(_memory_state.add_observations)
+mcp_app.tool(_memory_state.delete_entities)
+mcp_app.tool(_memory_state.delete_observations)
+mcp_app.tool(_memory_state.delete_relations)
+mcp_app.tool(_memory_state.search_nodes)
+mcp_app.tool(_memory_state.open_nodes)
 
 
 if __name__ == "__main__":

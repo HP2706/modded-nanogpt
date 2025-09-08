@@ -121,6 +121,7 @@ async def main(
         return []
 
     os.environ["USE_MODAL_SANDBOX"] = "1"
+    os.environ["RUN_DIR"] = "/root/sandbox/runs/2025-09-08_19-09-54" #TODO remove
     mcp_client = Client(mcp_app)
 
     # Visualization helpers
@@ -158,10 +159,11 @@ async def main(
                         "role": "user",
                         "content": """
                         modify the modded-nanogpt.py file to implement the technique from this paper.
-                        https://arxiv.org/pdf/2407.04620
+                        https://arxiv.org/pdf/2407.04620 .
+                        But check first if the paper hasnt already been downloaded in the papers folder.
                         Use the tools, note you can get the pdf to markdown using the pdf_to_markdown tool.
                         In your working folder(which you can see via bash), i have a minimal file for training a
-                        gpt2 style model. modify this file to implement the paper.
+                        gpt2 style model. modify this file to implement the paper. 
                         """,
                         'cache_control': {'type': 'ephemeral'}
                     },
@@ -210,46 +212,46 @@ async def main(
             while iters < max_iters:
                 logger.log_rule(f"Iteration {iters+1}")
                 tools_list = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.inputSchema
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.inputSchema,
+                        },
                     }
-                }
-                for tool in tools
+                    for tool in tools
                 ]
-            
-            
+
                 t0 = time.time()
                 response = await client.chat.completions.create(
-                    model="google/gemini-2.5-pro",
-                    #model="anthropic/claude-sonnet-4",
-                    #model="openai/gpt-5",
+                    #model="google/gemini-2.5-pro",
+                    model="anthropic/claude-sonnet-4",
+                    # model="openai/gpt-5",
                     messages=messages,
                     tools=tools_list,
                 )
                 t1 = time.time()
-            # Token usage accounting (best-effort)
-            usage = getattr(response, 'usage', None)
-            token_usage = None
-            if usage is not None:
-                try:
-                    input_tokens = getattr(usage, 'prompt_tokens', None) or getattr(usage, 'total_tokens', 0)
-                    output_tokens = getattr(usage, 'completion_tokens', 0)
-                    token_usage = TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
-                except Exception:
-                    token_usage = None
-                    
-            step_log = StepLog(timing=Timing(start_time=t0, end_time=t1), token_usage=token_usage)
-            monitor.update_metrics(step_log)
-            logger.log(f"LLM call duration: {t1 - t0:.2f}s", level=LogLevel.INFO)
-            
+
+                # Token usage accounting (best-effort)
+                usage = getattr(response, 'usage', None)
+                token_usage = None
+                if usage is not None:
+                    try:
+                        input_tokens = getattr(usage, 'prompt_tokens', None) or getattr(usage, 'total_tokens', 0)
+                        output_tokens = getattr(usage, 'completion_tokens', 0)
+                        token_usage = TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
+                    except Exception:
+                        token_usage = None
+
+                step_log = StepLog(timing=Timing(start_time=t0, end_time=t1), token_usage=token_usage)
+                monitor.update_metrics(step_log)
+                logger.log(f"LLM call duration: {t1 - t0:.2f}s", level=LogLevel.INFO)
+
                 messages.append({
                     'role': response.choices[0].message.role,
                     'content': response.choices[0].message.content,
-                    'tool_calls': response.choices[0].message.tool_calls
+                    'tool_calls': response.choices[0].message.tool_calls,
                 })
                 iters += 1
 
@@ -260,20 +262,20 @@ async def main(
                         saved_on_threshold = True
                     except Exception as e:
                         logger.log_error(f"Error saving logs: {e}")
-            
-            # Show assistant reply summary
-            try:
-                assistant_content = response.choices[0].message.content or ""
-                if isinstance(assistant_content, str):
-                    preview = assistant_content.strip()
-                else:
-                    preview = str(assistant_content)
-                if len(preview) > 1500:
-                    preview = preview[:1500] + "\n... (truncated)"
-                logger.log_markdown(preview, title="Assistant Reply")
-            except Exception as e:
-                logger.log_error(f"Error rendering assistant reply: {e}")
-            
+
+                # Show assistant reply summary
+                try:
+                    assistant_content = response.choices[0].message.content or ""
+                    if isinstance(assistant_content, str):
+                        preview = assistant_content.strip()
+                    else:
+                        preview = str(assistant_content)
+                    if len(preview) > 1500:
+                        preview = preview[:1500] + "\n... (truncated)"
+                    logger.log_markdown(preview, title="Assistant Reply")
+                except Exception as e:
+                    logger.log_error(f"Error rendering assistant reply: {e}")
+
                 if response.choices[0].message.tool_calls:
                     logger.log_markdown(
                         f"number of tool calls: {len(response.choices[0].message.tool_calls)}",
@@ -288,7 +290,7 @@ async def main(
                             messages.append({
                                 'role': 'tool',
                                 'tool_call_id': tool_call.id,
-                                'content': f"Error parsing tool input: {e}"
+                                'content': f"Error parsing tool input: {e}",
                             })
                             continue
                         logger.log_code("Tool Invocation", json.dumps({"name": tool_name, "args": tool_input}, indent=2))
@@ -309,7 +311,7 @@ async def main(
                             from mcp.types import TextContent, CallToolResult
                             result = CallToolResult(
                                 content=[TextContent(type="text", text=f"Error calling tool: {str(e)}")],
-                                is_error=True
+                                is_error=True,
                             )
                         content_blocks = getattr(result, 'content', [])
                         out_texts = []
@@ -319,7 +321,7 @@ async def main(
                         messages.append({
                             'role': 'tool',
                             'tool_call_id': tool_call.id,
-                            'content': "\n".join(out_texts) if out_texts else str(result)
+                            'content': "\n".join(out_texts) if out_texts else str(result),
                         })
         finally:
             try:
@@ -328,6 +330,10 @@ async def main(
                     logger.log_markdown(f"Saved to {path}", title="Final Log Save")
             except Exception as e:
                 logger.log_error(f"Error saving logs in finally: {e}")
+                # pickle them
+                import pickle
+                with open("messages.pkl", "wb") as f:
+                    pickle.dump(messages, f)
 
         # Final totals
         totals = monitor.get_total_token_counts()
@@ -335,10 +341,6 @@ async def main(
             json.dumps(totals.dict(), indent=2),
             title="Total Token Usage",
         )
-
-
-
-
 
 if __name__ == "__main__":
     asyncio.run(main())
