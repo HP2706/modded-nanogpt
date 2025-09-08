@@ -1,12 +1,12 @@
-from typing import Any, Literal, Annotated
+from typing import Literal, Annotated
 from pydantic import Field
-from .shared import maybe_truncate, run
+from .shared import maybe_truncate, LazySandBox
 from pathlib import Path
 from collections import defaultdict
-from typing import get_args
 import shlex
 import os
 import sys
+import subprocess
 
 # if on macOS we infer we are local and use the current directory's parent/sandbox
 if sys.platform == "darwin":
@@ -29,13 +29,16 @@ SNIPPET_LINES: int = 4
 class EditContainer:
     """Stateful file edit container supporting view, create, str_replace, and insert."""
 
-    def __init__(self, sandbox: Any | None = None, sandbox_root: str = "/root/sandbox", automount: str = automount_path):
+    def __init__(
+        self, 
+        sandbox: LazySandBox | None = None, 
+        automount_path: str = automount_path
+    ):
         # Track history per file
         self._file_history: dict[Path, list[str]] = defaultdict(list)
-        self._sandbox: Any | None = sandbox
-        self._sandbox_root: str = sandbox_root
+        self._sandbox = sandbox
         # local automount path (used when not in sandbox)
-        self._automount_path: str = automount
+        self._automount_path: str = automount_path
 
     async def view(
         self, 
@@ -47,9 +50,11 @@ class EditContainer:
         ] = None
     ) -> str:
         """Implement the view command; returns formatted text."""
-        self._validate_path("view", path)
+        path = self._resolve_local_path(path)
+        stdout = self._list_dir(path)
+        print(path, f"self._list_dir(path): {stdout}")
         # Directory listing
-        if self._is_dir(path):
+        if self.dir_or_file_exists(path, is_dir=True):
             if view_range:
                 raise ValueError(
                     "The `view_range` parameter is not allowed when `path` points to a directory."
@@ -57,10 +62,13 @@ class EditContainer:
 
             if self._sandbox is None:
                 # Map /root/sandbox to local automount path if on macOS
-                resolved = self._resolve_local_path(path)
-                _, stdout, stderr = await run(
-                    rf"find {resolved} -maxdepth 2 -not -path '*/\.*'"
-                )
+
+                sub_cmd = rf"find {path} -maxdepth 2 -not -path '*/\.*'"
+                
+                output = subprocess.run(sub_cmd, shell=True, capture_output=True, text=True)
+                stdout = output.stdout
+                stderr = output.stderr
+                
                 msg = ""
                 if stdout and not stderr:
                     msg = f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{stdout}\n"
@@ -68,9 +76,14 @@ class EditContainer:
                     msg = f"Error: {stderr}"
                 return msg or ""
             else:
-                resolved = self._resolve_sandbox_path(path)
-                out = self._sb_run(rf"find {shlex.quote(resolved)} -maxdepth 2 -not -path '*/\.*'")
-                stdout = out.strip()
+                p = await self._sandbox.exec(
+                    'bash',
+                    '-c',
+                    rf"find {path} -maxdepth 2 -not -path '*/\.*'",
+                )
+                p.wait()
+                stdout = p.stdout.read()
+
                 return f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{stdout}\n"
 
         file_content = self.read_file(path)
@@ -110,7 +123,7 @@ class EditContainer:
         new_str: Annotated[str | None, Field(description="Replacement string (use empty string to delete)")] = None
     ) -> str:
         """Implement the str_replace command, which replaces old_str with new_str in the file content"""
-        self._validate_path("str_replace", path)
+        path = self._resolve_local_path(path)
         # Read the file content
         file_content = self.read_file(path).expandtabs()
         old_str = old_str.expandtabs()
@@ -165,7 +178,7 @@ class EditContainer:
         new_str: Annotated[str, Field(description="String to insert")]
     ) -> str:
         """Implement the insert command, which inserts new_str at the specified line in the file content."""
-        self._validate_path("insert", path)
+        path = self._resolve_local_path(path)
         file_text = self.read_file(path).expandtabs()
         new_str = new_str.expandtabs()
         file_text_lines = file_text.split("\n")
@@ -209,47 +222,43 @@ class EditContainer:
         path: Annotated[Path, Field(description="Path to the file to read")]
     ) -> str:
         """Read the content of a file from a given path; raise an exception if an error occurs."""
-        self._validate_path("read", path)
+        path = self._resolve_local_path(path)
+        resolved = self._resolve_local_path(path)
         if self._sandbox is None:
-            try:
-                resolved = self._resolve_local_path(path)
-                return resolved.read_text()
-            except Exception as e:
-                raise RuntimeError(f"Ran into {e} while trying to read {path}") from e
+            return resolved.read_text()
         else:
-            try:
-                resolved = self._resolve_sandbox_path(path)
-                return self._sb_run(f"cat {shlex.quote(resolved)}")
-            except Exception as e:
-                raise RuntimeError(f"Ran into {e} while trying to read {path} in sandbox") from e
+            output = self._sandbox.exec('bash', '-c', f"cat {resolved}")
+            output.wait()
+            stdout = output.stdout.read()
+            stderr = output.stderr.read()
+            if stderr != "":
+                print(f"error: {stderr}")
+            return stdout
 
     def write_file(
         self, 
         path: Annotated[Path, Field(description="Path to the file to write")] , 
         file: str
-    ):
+    ) -> str:
         """Write the content of a file to a given path; raise an exception if an error occurs."""
-        self._validate_path("write", path)
+        path = self._resolve_local_path(path)
         if self._sandbox is None:
-            try:
-                resolved = self._resolve_local_path(path)
-                resolved.parent.mkdir(parents=True, exist_ok=True)
-                resolved.write_text(file)
-            except Exception as e:
-                raise RuntimeError(f"Ran into {e} while trying to write to {path}") from e
+            resolved = self._resolve_local_path(path)
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(file)
         else:
-            try:
-                resolved = self._resolve_sandbox_path(path)
-                parent_dir = os.path.dirname(resolved)
-                # Use a single-quoted heredoc and ensure parent directories exist
-                heredoc = (
-                    f"mkdir -p {shlex.quote(parent_dir)} && "
-                    f"cat > {shlex.quote(resolved)} << 'EOF'\n{file}\nEOF\n"
-                )
-                self._sb_run(heredoc)
-            except Exception as e:
-                raise RuntimeError(f"Ran into {e} while trying to write to {path} in sandbox") from e
-
+            resolved = self._resolve_local_path(path)
+            parent_dir = os.path.dirname(resolved)
+            # Use a single-quoted heredoc and ensure parent directories exist
+            heredoc = (
+                f"mkdir -p {parent_dir} && "
+                f"cat > {str(resolved)} << 'EOF'\n{file}\nEOF\n"
+            )
+            p = self._sandbox.exec('bash', '-c', heredoc)
+            p.wait()
+        
+        return f"The file {path} has been written."
+    
     def _make_output(
         self,
         file_content: str,
@@ -273,63 +282,40 @@ class EditContainer:
             + "\n"
         )
         
-    def _validate_path(self, command: str, path: Path):
-        """
-        Check that the path/command combination is valid.
-        """
-        # Resolve path for local automount checks, but keep original in messages
-        exists = self._exists(path)
-        is_dir = self._is_dir(path) if exists else False
-
-        if not exists and command != "create":
-            raise ValueError(
-                f"The path {path} does not exist. Please provide a valid path."
-            )
-        if exists and command == "create":
-            raise ValueError(
-                f"File already exists at: {path}. Cannot overwrite files using command `create`."
-            )
-        if is_dir and command != "view":
-            raise ValueError(
-                f"The path {path} is a directory and only the `view` command can be used on directories"
-            )
+    def _list_dir(self, path: Path) -> str:
+        path = self._resolve_local_path(path)
+        if self._sandbox is None:
+            return str(os.listdir(path))
+        else:
+            p = self._sandbox.exec('bash', '-c', f'ls {path}')
+            p.wait()
+            stdout = p.stdout.read()
+            stderr = p.stderr.read()
+            if stderr.strip() != "":
+                print(f"error: {stderr.strip()}")
+            return stdout
 
     # --- Helpers for Modal sandbox integration ---
-    def _sb_run(self, cmd: str) -> str:
-        """Run a command inside the provided sandbox and return stdout as text."""
+    def dir_or_file_exists(self, path: Path, is_dir: bool) -> bool:
+        path = self._resolve_local_path(path)
         if self._sandbox is None:
-            raise RuntimeError("Sandbox not configured")
-        # Prefix with cd to sandbox root for consistency
-        full_cmd = f"cd {shlex.quote(self._sandbox_root)} && {cmd}; echo '<<exit>>'"
-        p = self._sandbox.exec("bash", "-lc", full_cmd, bufsize=1)
-        sentinel = "<<exit>>"
-        out_chunks: list[str] = []
-        for line in p.stdout:
-            s = line.decode() if isinstance(line, (bytes, bytearray)) else str(line)
-            if sentinel in s:
-                s = s.split(sentinel)[0]
-                if s:
-                    out_chunks.append(s)
-                break
-            out_chunks.append(s)
-        p.wait()
-        return "".join(out_chunks)
-
-    def _exists(self, path: Path) -> bool:
-        if self._sandbox is None:
-            resolved = self._resolve_local_path(path)
-            return resolved.exists()
-        resolved = self._resolve_sandbox_path(path)
-        out = self._sb_run(f"if test -e {shlex.quote(resolved)}; then echo yes; else echo no; fi")
-        return out.strip().endswith("yes")
-
-    def _is_dir(self, path: Path) -> bool:
-        if self._sandbox is None:
-            resolved = self._resolve_local_path(path)
-            return resolved.is_dir()
-        resolved = self._resolve_sandbox_path(path)
-        out = self._sb_run(f"if test -d {shlex.quote(resolved)}; then echo yes; else echo no; fi")
-        return out.strip().endswith("yes")
+            if is_dir:
+                return path.is_dir()
+            else:
+                return path.exists()
+        else:
+            if is_dir:
+                test_flag = "d"
+            else:
+                test_flag = "e"
+            out = self._sandbox.exec('bash', '-c', f"if test -{test_flag} {str(path)}; then echo yes; else echo no; fi")
+            out.wait()
+            stdout = out.stdout.read()
+            stderr = out.stderr.read()
+            if stderr.strip() != "":
+                print(f"error: {stderr.strip()}")
+            val = stdout.strip().endswith("yes")
+            return val
 
     def _resolve_local_path(self, path: Path) -> Path:
         """Resolve any given path (absolute or relative) into the local automount root.
@@ -344,14 +330,16 @@ class EditContainer:
             suffix = p_str[len("/root/sandbox"):].lstrip("/")
         else:
             suffix = p_str.lstrip("/") if path.is_absolute() else p_str
-        return Path(self._automount_path) / suffix
+        
+        path = Path(self._automount_path) / suffix
+        
+        if self._sandbox is not None:
+            p = self._sandbox.exec('bash', '-c', f'ls {path}')
+            p.wait()
+            stdout = p.stdout.read()
+            stderr = p.stderr.read()
+            print(f"error: {stderr.strip()}")
+            print(f"stdout: {stdout}")
+        
+        return path
 
-    def _resolve_sandbox_path(self, path: Path) -> str:
-        """Resolve any given path (absolute or relative) into the sandbox automount root.
-        All operations are confined under self._sandbox_root in sandbox mode.
-        """
-        p_str = str(path)
-        if p_str.startswith(self._sandbox_root):
-            return p_str
-        suffix = p_str.lstrip("/") if path.is_absolute() else p_str
-        return os.path.join(self._sandbox_root, suffix)

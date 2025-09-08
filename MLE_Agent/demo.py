@@ -37,7 +37,7 @@ async def main():
     async with mcp_client:
         tools = await mcp_client.list_tools()
 
-        output = await mcp_client.call_tool("bash", {"command": "ls -la"})
+        output = await mcp_client.call_tool("run_command", {"command": "ls -la"})
         logger.log_markdown("Bootstrapping with `ls -la` via bash tool:", title="Bootstrap", level=LogLevel.INFO)
         try:
             content_blocks = getattr(output, 'content', [])
@@ -58,7 +58,7 @@ async def main():
                 "content": """
                 You are given the following tools.
                 - edit; to edit files
-                - bash; run terminal commands
+                - run_command; run terminal commands
                 - pdf_to_markdown; curls a pdf from a url and converts it to easily readable markdown
                 """,
                 'cache_control': {
@@ -111,8 +111,8 @@ async def main():
             
             t0 = time.time()
             response = await client.chat.completions.create(
-                #model="google/gemini-2.5-pro",
-                model="anthropic/claude-sonnet-4",
+                model="google/gemini-2.5-pro",
+                #model="anthropic/claude-sonnet-4",
                 #model="openai/gpt-5",
                 messages=messages,
                 tools=tools_list,
@@ -139,6 +139,7 @@ async def main():
                 'tool_calls': response.choices[0].message.tool_calls
             })
             iters += 1
+            
             # Show assistant reply summary
             try:
                 assistant_content = response.choices[0].message.content or ""
@@ -159,11 +160,23 @@ async def main():
                 )
                 for tool_call in response.choices[0].message.tool_calls:
                     tool_name = tool_call.function.name
-                    tool_input = json.loads(tool_call.function.arguments)
+                    try:
+                        tool_input = json.loads(tool_call.function.arguments)
+                    except Exception as e:
+                        logger.log_error(f"Error parsing tool input: {e}")
+                        # add tool message to messages
+                        messages.append({
+                            'role': 'tool',
+                            'tool_call_id': tool_call.id,
+                            'content': f"Error parsing tool input: {e}"
+                        })
+                        continue
+                        
                     logger.log_code("Tool Invocation", json.dumps({"name": tool_name, "args": tool_input}, indent=2))
                     try:
                         # call mcp server tool
                         result = await mcp_client.call_tool(tool_name, tool_input)
+                        print(f"result: {result} from tool {tool_name}")
                         # Render tool result
                         content_blocks = getattr(result, 'content', [])
                         out_texts = []

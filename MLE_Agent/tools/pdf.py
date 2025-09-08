@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from .bash import BashContainer, _ModalBashSession
 from .edit import EditContainer
-from .shared import agent_volume
+from .shared import agent_volume, LazySandBox
 
 # Separate Modal app to avoid conflicts with any Sandbox app
 app = App("mle-agent-pdf")
@@ -182,55 +182,24 @@ def save_pdf_to_markdown(base_dir: str, dict_bytes: dict[str, bytes], title: str
         "/root/sandbox": agent_volume,
     },
 )
-def pdf_to_markdown(
+def pdf_run_marker_gpu(
     pdf_url: str,
     base_dir: str,
+    arxiv_title: str | None = None,
+    source_url: str | None = None,
     page_range: str | None = None,
     save_remote: bool = True,
-    force_redo: bool = False,
-) -> str | tuple[dict[str, bytes], str]:
-    os.makedirs(base_dir, exist_ok=True)
+    CACHE_ROOT: Path = Path("/root/sandbox/paper_cache"),
+):
     import tempfile
     import torch
-    import shutil
-
-    # Prepare cache root
-    CACHE_ROOT = Path("/root/sandbox/paper_cache")
-    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-
+    
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_dir_p = Path(temp_dir)
         output_dir = temp_dir_p / "output"
         pdf_path = temp_dir_p / "input.pdf"
-
-        arxiv_pdf_url, arxiv_title, _ = _parse_arxiv_info(pdf_url)
-        source_url = pdf_url
-        pdf_url = arxiv_pdf_url
-
-        # Try an early title guess to hit the cache before heavy work
-        pre_title_guess = _sanitize_title(
-            (arxiv_title or _guess_title_from_url(source_url) or "")
-        ) if (arxiv_title or _guess_title_from_url(source_url)) else None
-
-        if pre_title_guess:
-            cached_dir = CACHE_ROOT / pre_title_guess
-            if cached_dir.exists() and any(cached_dir.glob("*.md")) and not force_redo:
-                if save_remote:
-                    # Copy from cache into model directory and return a path
-                    dest_dir = Path(base_dir) / "papers" / pre_title_guess
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(cached_dir, dest_dir, dirs_exist_ok=True)
-                    md_file = next((p for p in dest_dir.glob("*.md")), None)
-                    return str(md_file) if md_file else str(dest_dir)
-                else:
-                    # Return the cached files to be saved locally by caller
-                    result_cached: dict[str, bytes] = {}
-                    for fp in cached_dir.rglob("*"):
-                        if fp.is_file():
-                            result_cached[fp.name] = fp.read_bytes()
-                    return result_cached, pre_title_guess
-
-        subprocess.run(["curl", "-L", pdf_url, "-o", pdf_path], check=True)
+        
+        subprocess.run(["curl", "-L", pdf_url, "-o", str(pdf_path)], check=True)
         print(f"PDF path: {pdf_path}")
         print(f"Temp dir: {temp_dir_p} {os.listdir(temp_dir_p)}")
 
@@ -245,7 +214,7 @@ def pdf_to_markdown(
             "--MarkdownRenderer_page_separator",
             "---PAGE---",
             "--output_dir",
-            output_dir,
+            str(output_dir),
         ]
         if page_range:
             cmds.extend(["--page_range", page_range])
@@ -274,6 +243,10 @@ def pdf_to_markdown(
             with open(out_path, "wb") as f:
                 f.write(value)
 
+        print(f"title_guess: {title_guess}")
+        print(f"base_dir: {base_dir}")
+        print(f"save_remote: {save_remote}")
+        
         if save_remote:
             output = save_pdf_to_markdown(base_dir, result, title_guess)
         else:
@@ -282,11 +255,80 @@ def pdf_to_markdown(
         print(f"os.listdir({base_dir}): {os.listdir(base_dir)}")
         return output
 
+@app.function(
+    image=image,
+    timeout=60 * 10,
+    serialized=True,
+    volumes={
+        "/root/sandbox": agent_volume,
+    },
+)
+def pdf_to_markdown(
+    pdf_url: str,
+    base_dir: str,
+    page_range: str | None = None,
+    save_remote: bool = True,
+    force_redo: bool = False,
+) -> str | tuple[dict[str, bytes], str]:
+    os.makedirs(base_dir, exist_ok=True)
+    import shutil
+
+    # Prepare cache root
+    CACHE_ROOT = Path("/root/sandbox/paper_cache")
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+    arxiv_pdf_url, arxiv_title, _ = _parse_arxiv_info(pdf_url)
+    source_url = pdf_url
+    pdf_url = arxiv_pdf_url
+
+    # Try an early title guess to hit the cache before heavy work
+    pre_title_guess = _sanitize_title(
+        (arxiv_title or _guess_title_from_url(source_url) or "")
+    ) if (arxiv_title or _guess_title_from_url(source_url)) else None
+
+    
+    if pre_title_guess and not force_redo:
+        cached_dir = CACHE_ROOT / pre_title_guess
+        if cached_dir.exists() and any(cached_dir.glob("*.md")):
+            if save_remote:
+                # Copy from cache into model directory and return a path
+                dest_dir = Path(base_dir) / "papers" / pre_title_guess
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(cached_dir, dest_dir, dirs_exist_ok=True)
+                md_file = next((p for p in dest_dir.glob("*.md")), None)
+                            
+                print(f"title_guess: {pre_title_guess}")
+                print(f"base_dir: {base_dir}")
+                print(f"save_remote: {save_remote}")
+                print(f"md_file: {md_file}")
+                print(f"dest_dir: {dest_dir}")
+                print(f'os.listdir({base_dir}/papers): {os.listdir(f"{base_dir}/papers")}')
+                return str(md_file) if md_file else str(dest_dir)
+            else:
+                # Return the cached files to be saved locally by caller
+                result_cached: dict[str, bytes] = {}
+                for fp in cached_dir.rglob("*"):
+                    if fp.is_file():
+                        result_cached[fp.name] = fp.read_bytes()
+                return result_cached, pre_title_guess
+    else:
+        return pdf_run_marker_gpu.remote(
+            pdf_url=pdf_url, 
+            base_dir=base_dir, 
+            arxiv_title=arxiv_title, 
+            source_url=source_url, 
+            page_range=page_range, 
+            save_remote=save_remote, 
+            force_redo=force_redo,
+            CACHE_ROOT=CACHE_ROOT
+        )
+        
 
 class PdfContainer:
-    def __init__(self, bash_container: BashContainer, edit_container: EditContainer):
+    def __init__(self, bash_container: BashContainer, edit_container: EditContainer, shared_sandbox: LazySandBox):
         self.edit_container = edit_container
         self.bash_container = bash_container
+        self._shared_sandbox = shared_sandbox # only used for reloading volumes
         
     async def pdf_to_markdown(
         self, 
@@ -295,15 +337,25 @@ class PdfContainer:
         )], 
         page_range: Annotated[str | None, Field(
             description=(
-            "The page range to convert to markdown. None means convert the entire pdf, else "
+            "The page range to convert to markdown. None (default) means convert the entire pdf, else "
             "Page range to convert, specify comma separated page numbers or ranges. Example: 0,5-10,20 will convert pages 0, 5-10, and 20"
-        ))],
+        ))] = None,
         force_redo: Annotated[bool, Field(
             description="Whether to force redoing the conversion instead of using the cached version"
-        )],
+        )] = False,
     ) -> str:
-        base_dir = await self.bash_container.ensure_cwd()
+        if page_range is not None:
+            print(f"page_range: {page_range}")
+            if page_range == "":
+                page_range = None
+            elif page_range == "null":
+                print("page_range is null")
+                page_range = None
+            elif page_range == "None":
+                print("page_range is None")
+                page_range = None
         
+        base_dir = await self.bash_container.ensure_cwd()
         if isinstance(self.bash_container._session, _ModalBashSession):
             save_remote = True
         else:
@@ -315,7 +367,31 @@ class PdfContainer:
                 if not save_remote:
                     data_dict, title = o
                     path = save_pdf_to_markdown(base_dir, data_dict, title)
-                    return path
                 else:
-                    return o
+                    path = o
+        
+        # reload volumes
+        if self._shared_sandbox is not None:
+            print("reloading volumes")
+            # run 
+            
+            p = self._shared_sandbox.exec(
+                "bash",
+                "-c",
+                "LAST_ACTIVE_DIR=$(cd /root/sandbox/runs/ && ls -td -- */ | head -n 1) && ls /root/sandbox/runs/$LAST_ACTIVE_DIR"
+            )
+            p.wait()
+            print(f"p: {p.stdout.read()} {p.stderr.read()}")
+            self._shared_sandbox.reload_volumes()
+            print("after reloading volumes")
+            p = self._shared_sandbox.exec(
+                "bash",
+                "-c",
+                "LAST_ACTIVE_DIR=$(cd /root/sandbox/runs/ && ls -td -- */ | head -n 1) && ls /root/sandbox/runs/$LAST_ACTIVE_DIR"
+            )
+            p.wait()
+            print(f"p: {p.stdout.read()} {p.stderr.read()}")
+            
+        
+        return path
         

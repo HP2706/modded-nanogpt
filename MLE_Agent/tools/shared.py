@@ -4,6 +4,7 @@
 import asyncio
 import logging
 from modal import Volume
+import modal
 
 agent_volume = Volume.from_name("mle-sandbox", create_if_missing=True)
 fineweb10B_volume = Volume.from_name("fineweb10B", create_if_missing=True)
@@ -24,30 +25,29 @@ def maybe_truncate(content: str, truncate_after: int | None = MAX_RESPONSE_LEN):
     )
 
 
-async def run(
-    cmd: str,
-    timeout: float | None = 120.0,  # seconds
-    truncate_after: int | None = MAX_RESPONSE_LEN,
-):
-    """Run a shell command asynchronously with a timeout."""
-    process = await asyncio.create_subprocess_shell(
-        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-
-    try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        return (
-            process.returncode or 0,
-            maybe_truncate(stdout.decode(), truncate_after=truncate_after),
-            maybe_truncate(stderr.decode(), truncate_after=truncate_after),
+class LazySandBox:
+    def __init__(self, **kwargs):
+        self._kwargs = kwargs
+        
+        self._sandbox = modal.Sandbox.create(
+            **self._kwargs,
         )
-    except asyncio.TimeoutError as exc:
+    
+    def exec(self, *args, **kwargs):
         try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        raise TimeoutError(
-            f"Command '{cmd}' timed out after {timeout} seconds"
-        ) from exc
-        
-        
+            return self._sandbox.exec(*args, **kwargs)
+        except Exception as e:
+            print("error, timeout, restarting sandbox")
+            self._sandbox = modal.Sandbox.create(
+                **self._kwargs,
+            )
+            return self._sandbox.exec(*args, **kwargs)
+
+    def reload_volumes(self):
+        try:
+            self._sandbox.reload_volumes()
+        except Exception as e:
+            self._sandbox = modal.Sandbox.create(
+                **self._kwargs,
+            )
+            

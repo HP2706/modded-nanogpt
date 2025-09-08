@@ -5,11 +5,12 @@ Preserves Modal Sandbox support (USE_MODAL_SANDBOX=1) and tool names.
 
 import os
 import logging
+import asyncio
 from fastmcp import FastMCP
 from tools.bash import BashContainer
 from tools.edit import EditContainer
 from tools.pdf import PdfContainer
-from tools.shared import agent_volume, fineweb10B_volume
+from tools.shared import agent_volume, fineweb10B_volume, LazySandBox
 import modal
 
 logger = logging.getLogger(__name__)
@@ -41,24 +42,43 @@ if _use_modal:
             "einx",
             "matplotlib",
         )
-        _shared_sandbox = modal.Sandbox.create(
-            app=modal_app,
-            image=image,
-            volumes={
+        
+        kwargs = {
+            "app": modal_app,
+            "image": image,
+            "volumes": {
                 "/root/sandbox": agent_volume,
                 "/root/fineweb10B": fineweb10B_volume,
             },
-            timeout=120,
-        )
+            "timeout": 60*20,
+        }
+        _shared_sandbox = LazySandBox(**kwargs)
     except Exception as e:
         logger.warning(
             f"Could not start Modal Sandbox, falling back to local tools: {e}"
         )
         _shared_sandbox = None
+        
+
+
 
 _bash_state = BashContainer(sandbox=_shared_sandbox) if _shared_sandbox else BashContainer()
-_edit_state = EditContainer(sandbox=_shared_sandbox) if _shared_sandbox else EditContainer()
-_pdf_state = PdfContainer(bash_container=_bash_state, edit_container=_edit_state)
+
+async def get_automount_path():
+    return await _bash_state.ensure_cwd()
+
+automount_path = asyncio.run(get_automount_path())
+
+_edit_state = EditContainer(
+    sandbox=_shared_sandbox,
+    automount_path=automount_path
+) if _shared_sandbox else EditContainer()
+
+_pdf_state = PdfContainer(
+    bash_container=_bash_state, 
+    edit_container=_edit_state,
+    shared_sandbox=_shared_sandbox
+)
 
 # Register object methods directly so they can share state
 # bash tools

@@ -10,7 +10,7 @@ import shutil
 from pathlib import Path
 from typing import Dict
 from modal.stream_type import StreamType
-
+from .shared import LazySandBox
 # if on macos we infer we are local and use the current directory
 if sys.platform == "darwin":
     automount_path = os.path.dirname(os.path.abspath(os.getcwd()))
@@ -143,9 +143,7 @@ class _BashSession:
             result_parts.append(output)
         if error:
             result_parts.append(f"Error: {error}")
-
         return "\n".join(result_parts) if result_parts else "Command executed successfully"
-
 
 class _ModalBashSession:
     """A stateful bash session inside a Modal Sandbox, mirroring _BashSession."""
@@ -154,7 +152,11 @@ class _ModalBashSession:
     _output_delay: float = 0.2  # seconds
     _timeout: float = 120.0  # seconds
 
-    def __init__(self, sandbox: Any, root: str = "/root/sandbox"):
+    def __init__(
+        self, 
+        sandbox: Any, 
+        root: str = "/root/sandbox"
+    ):
         self._sandbox = sandbox
         self._root = root
         self._started = False
@@ -163,18 +165,17 @@ class _ModalBashSession:
         self._run_dir = f"{self._root}/runs/{ts}"
         
         self._prefix_cmd = f'cd {self._run_dir}'
-        
+        self._started = False
         
     async def start(self):
         if self._started:
             return
         
-        # Prepare run directory and copy modded-nanogpt.py if present
         setup_cmd = (
             f"mkdir -p {self._run_dir} && "
-            f"cp /root/modded-nanogpt.py {(self._run_dir)}"
+            f"cp /root/sandbox/modded-nanogpt.py {(self._run_dir)}"
         )
-        
+
         _p = self._sandbox.exec(
             "bash",
             "-c",
@@ -183,7 +184,9 @@ class _ModalBashSession:
             stderr=StreamType.PIPE,
         )
         _p.wait()
+
         self._started = True
+        print(f"setup_cmd: {setup_cmd} _p: {_p.stdout.read()} {_p.stderr.read()}")
 
     async def run(
         self, 
@@ -191,18 +194,28 @@ class _ModalBashSession:
         blocking: bool = True,
     ) -> str:
         # Wrap blocking read/write in a thread to avoid blocking the event loop
+        if not self._started:
+            await self.start()
+            
+        _p1 = self._sandbox.exec(
+            "bash",
+            "-c",
+            f"ls {self._run_dir}",  
+        )
+        _p1.wait()
+        print(f"ls {self._run_dir}: {_p1.stdout.read()} {_p1.stderr.read()}")
+        
         _p = self._sandbox.exec(
             "bash",
             "-c",
             f"{self._prefix_cmd} && {command}",
         )
+        
         if blocking:
             _p.wait()
             stdout = _p.stdout.read()
             stderr = _p.stderr.read()
-            if stderr:
-                return f"stdout: {stdout}\nstderr: {stderr}"
-            return f"stdout: {stdout}"
+            return f"stdout: {stdout}\nstderr: {stderr} returncode: {_p.returncode}"
     
 class BashContainer:
     """
@@ -212,7 +225,7 @@ class BashContainer:
     _session: _ModalBashSession | _BashSession
     def __init__(
         self, 
-        sandbox: modal.Sandbox | None = None, 
+        sandbox: LazySandBox | None = None, 
         automount_path: str = '/root/sandbox', 
     ):
         if sandbox is not None:
@@ -336,7 +349,11 @@ class BashContainer:
         command: Annotated[str, Field(description="The bash command to execute")]
     ) -> Annotated[str, Field(description="Output from the executed bash command")]:
         """Execute a regular bash command."""
-        return await self._session.run(command)
+        text = await self._session.run(command)
+        # ensure it is not too long
+        if len(text) > 10000:
+            return text[:10000] + "..."
+        return text
 
     async def stop_background_job(
         self,
