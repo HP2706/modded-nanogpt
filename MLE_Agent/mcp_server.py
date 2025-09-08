@@ -51,7 +51,7 @@ if _use_modal:
                 "/root/sandbox": agent_volume,
                 "/root/fineweb10B": fineweb10B_volume,
             },
-            timeout=30,
+            timeout=120,
         )
     except Exception as e:
         logger.warning(
@@ -64,8 +64,21 @@ _edit_state = EditContainer(sandbox=_shared_sandbox) if _shared_sandbox else Edi
 _pdf_state = PdfContainer(bash_container=_bash_state, edit_container=_edit_state)
 
 # Register object methods directly so they can share state
-mcp_app.tool(_bash_state.bash)
-mcp_app.tool(_edit_state.str_replace_editor)
+# bash tools
+mcp_app.tool(_bash_state.run_command)
+mcp_app.tool(_bash_state.run_command_background)
+mcp_app.tool(_bash_state.stop_background_job)
+mcp_app.tool(_bash_state.poll_background_job)
+mcp_app.tool(_bash_state.list_background_jobs)
+mcp_app.tool(_bash_state.restart_session)
+
+# edit tools
+mcp_app.tool(_edit_state.str_replace)
+mcp_app.tool(_edit_state.view)
+mcp_app.tool(_edit_state.insert)
+mcp_app.tool(_edit_state.read_file)
+mcp_app.tool(_edit_state.write_file)
+
 mcp_app.tool(_pdf_state.pdf_to_markdown)
 
 if __name__ == "__main__":

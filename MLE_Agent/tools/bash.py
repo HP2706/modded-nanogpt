@@ -1,7 +1,7 @@
 import asyncio
 import modal
 import os
-from typing import Any, Sequence, Annotated
+from typing import Any, Annotated
 from pydantic import Field
 from fastmcp import Context
 import sys
@@ -227,128 +227,131 @@ class BashContainer:
     async def ensure_cwd(self) -> str:
         """Ensure a session is started and return its working directory."""
         await self._session.start()
-        return self._session._run_dir   
+        return self._session._run_dir
 
-    async def bash(
+    async def restart_session(
         self,
-        command: Annotated[str | None, Field(
-            description="The bash command to execute"
-        )]=None,
-        restart: Annotated[bool, Field(
-            description="Restart the bash session (new run dir)"
-        )]=False,
-        background: Annotated[bool, Field(
-            description="Run a bash command as a background job and return immediately"
-        )]=False,
-        name: Annotated[str | None, Field(
-            description="Job name for background, peek, stop, or poll"
-        )]=None,
-        stop: Annotated[bool, Field(
-            description="Stop a named background job"
-        )]=False,
-        list_jobs: Annotated[bool, Field(
-            description="List background jobs tracked by this session"
-        )]=False,
-        poll: Annotated[bool, Field(
-            description=(
-                "Poll status (RUNNING/STOPPED) for a named background job,"
-                "useful for monitoring the job and checking if it is still running"
-            )
-        )]=False,
-        ctx : Context = None
+        ctx: Annotated[Context | None, Field(description="Optional context for debugging")] = None
     ) -> str:
-        '''
-        Args: 
-            
-        '''
-        ctx.debug(f"bash command: {command}") if ctx else None
-        # Modal sandboxed session
-        if restart:
-            await self._session.start()
-            self._session = _ModalBashSession(self._sandbox, root=self._sandbox_root)
-            return f"tool has been restarted. cwd: {self._session._run_dir}"
+        """Restart the bash session with a new run directory."""
+        ctx.debug("restarting bash session") if ctx else None
+        await self._session.start()
+        self._session = _ModalBashSession(self._sandbox, root=self._sandbox_root)
+        return f"tool has been restarted. cwd: {self._session._run_dir}"
 
-        if (
-            command is None and not background and not stop and not list_jobs and not poll
-        ):
-            return f"tool started. cwd: {self._session._run_dir}"
-
-        logs_dir = ".mcp_logs"
-
-        if list_jobs:
-            if not self._jobs:
-                return "No background jobs."
-            lines_out: list[str] = []
-            for jname, job in self._jobs.items():
-                pid = job.get("pid", -1)
-                out = await self._session.run(f"kill -0 {pid} >/dev/null 2>&1; echo $?")
-                text = out.strip()
-                code = text.splitlines()[-1] if text else "1"
-                status = "RUNNING" if code == "0" else "STOPPED"
-                lines_out.append(f"- {jname}: {status} (pid {pid}) log: {job.get('log','')}")
-            return "\n".join(lines_out)
-
-        
-        if background:
-            if not command:
-                raise ValueError("background requires a 'command'")
-            if not name:
-                raise ValueError("background requires a 'name'")
-            
-            # create logs dir if it doesn't exist
-            text = await self._session.run(f"mkdir -p {logs_dir}")
-            print('text post mkdir', text)
-            log_file = f"{logs_dir}/{name}.log"
-            
-            logs_dir = f"{self._session._run_dir}/.mcp_logs"
-            log_file = f"{logs_dir}/{name}.log"
-
-            command = f"""
-            nohup bash -lc 'echo $$ >> {log_file}.pid; {command}' | tee {log_file} 
-            """
-            #nohup bash -lc 'echo $$ >> {log_file}.pid; your_command' | tee {log_file}
-            # get pid by reading first line in tee log file
-            _ = await self._session.run(command, blocking=False)
-            await asyncio.sleep(3) # give enough time for the pid to be written to the log file
-            
-            pid_text = await self._session.run(f"sed -n '1p' {log_file}.pid")
-            #pid_text = stdout: pid
-            pid = int(pid_text.split(': ')[1].strip())
-            self._jobs[name] = {"pid": pid, "log": log_file}
-            
-            return (
-                f"Started job '{name}' pid {pid}. Logs: {log_file}.\n"
-                "This process is running in the background. You can:\n"
-                f"- if you want to peek the logs, you can read specific lines via sed.\n"
-                f"- for example to read the first 100 lines, you can use: sed -n '1,100p' '{log_file}'"
-                f"- poll status: {{'poll': true, 'name': '{name}'}}\n"
-                f"- stop job: {{'stop': true, 'name': '{name}'}}\n"
-                f"- list jobs: {{'list_jobs': true}}"
-            )
-
-        if stop:
-            if not name:
-                raise ValueError("stop requires a 'name'")
-            job = self._jobs.get(name)
-            if not job:
-                raise ValueError(f"unknown job '{name}'")
-            await self._session.run(f"kill {job['pid']} || true")
-            return f"stopped job '{name}' (pid {job['pid']})"
-
-        if poll:
-            if not name:
-                raise ValueError("poll requires a 'name'")
-            job = self._jobs.get(name)
-            if not job:
-                raise ValueError(f"unknown job '{name}'")
-            out = await self._session.run(f"kill -0 {job['pid']} >/dev/null 2>&1; echo $?")
+    async def list_jobs(self) -> Annotated[str, Field(description="List of all background jobs with their status")]:
+        """List all background jobs tracked by this session."""
+        if not self._jobs:
+            return "No background jobs."
+        lines_out: list[str] = []
+        for jname, job in self._jobs.items():
+            pid = job.get("pid", -1)
+            out = await self._session.run(f"kill -0 {pid} >/dev/null 2>&1; echo $?")
             text = out.strip()
             code = text.splitlines()[-1] if text else "1"
             status = "RUNNING" if code == "0" else "STOPPED"
-            return f"{name}: {status} (pid {job['pid']})"
+            lines_out.append(f"- {jname}: {status} (pid {pid}) log: {job.get('log','')}")
+        return "\n".join(lines_out)
 
-        if command is not None:
-            out = await self._session.run(command)
-            return out
+    async def run_command_background(
+        self,
+        command: Annotated[str, Field(
+        description=(
+            "The bash command to run in background,"
+            "very useful if you want to run a long job like a training run, etc."
+        ))],
+        name: Annotated[str, Field(description="Unique name for the background job")]
+    ) -> Annotated[str, Field(description="Job startup confirmation with management instructions")]:
+        """Run a bash command as a background job and return immediately."""
+        if not command:
+            raise ValueError("background requires a 'command'")
+        if not name:
+            raise ValueError("background requires a 'name'")
 
-        raise ValueError("no command provided.")
+        logs_dir = ".mcp_logs"
+
+        # create logs dir if it doesn't exist
+        text = await self._session.run(f"mkdir -p {logs_dir}")
+        print('text post mkdir', text)
+        log_file = f"{logs_dir}/{name}.log"
+
+        logs_dir = f"{self._session._run_dir}/.mcp_logs"
+        log_file = f"{logs_dir}/{name}.log"
+
+        command = f"""
+        nohup bash -lc 'echo $$ >> {log_file}.pid; {command}' | tee {log_file}
+        """
+        #nohup bash -lc 'echo $$ >> {log_file}.pid; your_command' | tee {log_file}
+        # get pid by reading first line in tee log file
+        _ = await self._session.run(command, blocking=False)
+        await asyncio.sleep(3) # give enough time for the pid to be written to the log file
+
+        pid_text = await self._session.run(f"sed -n '1p' {log_file}.pid")
+        #pid_text = stdout: pid
+        pid = int(pid_text.split(': ')[1].strip())
+        self._jobs[name] = {"pid": pid, "log": log_file}
+
+        return (
+            f"Started job '{name}' pid {pid}. Logs: {log_file}.\n"
+            "This process is running in the background. You can:\n"
+            f"- if you want to peek the logs, you can read specific lines via sed.\n"
+            f"- for example to read the first 100 lines, you can use: sed -n '1,100p' '{log_file}'"
+            f"- poll status: {{'poll': true, 'name': '{name}'}}\n"
+            f"- stop job: {{'stop': true, 'name': '{name}'}}\n"
+            f"- list jobs: {{'list_jobs': true}}"
+        )
+
+    async def stop_job(
+        self,
+        name: Annotated[str, Field(description="Name of the background job to stop")]
+    ) -> Annotated[str, Field(description="Confirmation that the job has been stopped")]:
+        """Stop a named background job."""
+        if not name:
+            raise ValueError("stop requires a 'name'")
+        
+        job = self._jobs.get(name)
+        if not job:
+            raise ValueError(f"unknown job '{name}'")
+        await self._session.run(f"kill {job['pid']} || true")
+        return f"stopped job '{name}' (pid {job['pid']})"
+
+    async def poll_job(
+        self,
+        name: Annotated[str, Field(description="Name of the background job to check status")]
+    ) -> Annotated[str, Field(description="Current status of the background job")]:
+        """Poll status (RUNNING/STOPPED) for a named background job."""
+        if not name:
+            raise ValueError("poll requires a 'name'")
+        job = self._jobs.get(name)
+        if not job:
+            raise ValueError(f"unknown job '{name}'")
+        out = await self._session.run(f"kill -0 {job['pid']} >/dev/null 2>&1; echo $?")
+        text = out.strip()
+        code = text.splitlines()[-1] if text else "1"
+        status = "RUNNING" if code == "0" else "STOPPED"
+        return f"{name}: {status} (pid {job['pid']})"
+
+    async def run_command(
+        self,
+        command: Annotated[str, Field(description="The bash command to execute")]
+    ) -> Annotated[str, Field(description="Output from the executed bash command")]:
+        """Execute a regular bash command."""
+        return await self._session.run(command)
+
+    async def stop_background_job(
+        self,
+        name: Annotated[str, Field(description="Name of the background job to stop")]
+    ) -> Annotated[str, Field(description="Confirmation that the job has been stopped")]:
+        """Stop a background job."""
+        return await self.stop_job(name)
+
+    async def poll_background_job(
+        self,
+        name: Annotated[str, Field(description="Name of the background job to check status")]
+    ) -> Annotated[str, Field(description="Current status of the background job")]:
+        """Check status of a background bash job."""
+        return await self.poll_job(name)
+
+    async def list_background_jobs(self) -> Annotated[str, Field(description="List of all background jobs with their status")]:
+        """List all background bash jobs."""
+        return await self.list_jobs()
