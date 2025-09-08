@@ -1,15 +1,15 @@
 import asyncio
+import modal
 import os
 from typing import Any, Sequence, Annotated
 from pydantic import Field
-from mcp.types import TextContent
 from fastmcp import Context
 import sys
-import shlex
 import datetime
 import shutil
 from pathlib import Path
 from typing import Dict
+from modal.stream_type import StreamType
 
 # if on macos we infer we are local and use the current directory
 if sys.platform == "darwin":
@@ -37,7 +37,7 @@ class _BashSession:
         self._started = False
         self._timed_out = False
         self._automount_path = automount_path
-        ts = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
         self._run_dir = os.path.join(self._automount_path, "runs", ts)
 
     async def start(self):
@@ -78,15 +78,21 @@ class _BashSession:
             return
         self._process.terminate()
 
-    async def run(self, command: str) -> Sequence[TextContent]:
+    async def run(self, command: str) -> str:
         """Execute a command in the bash shell."""
         if not self._started:
-            raise RuntimeError("Session has not started.")
+            return "tool must be restarted\nSession has not started."
         if self._process.returncode is not None:
-            return [
-                TextContent(type="text", text="tool must be restarted"),
-                TextContent(type="text", text=f"Error: bash has exited with returncode {self._process.returncode}")
-            ]
+            self._process.wait()
+            return (
+                f"Error: bash has exited with "
+                f"returncode {self._process.returncode}"
+                f"stdout {self._process.stdout.read()}"
+                f"stderr {self._process.stderr.read()}"
+            )
+
+        if self._timed_out:
+            return f"Error: bash has timed out after {self._timeout} seconds and must be restarted"
         if self._timed_out:
             raise RuntimeError(
                 f"timed out: bash has not returned in {self._timeout} seconds and must be restarted"
@@ -132,25 +138,21 @@ class _BashSession:
         self._process.stdout._buffer.clear()  # pyright: ignore[reportAttributeAccessIssue]
         self._process.stderr._buffer.clear()  # pyright: ignore[reportAttributeAccessIssue]
 
-        contents = []
+        result_parts = []
         if output:
-            contents.append(TextContent(type="text", text=output))
+            result_parts.append(output)
         if error:
-            contents.append(TextContent(type="text", text=f"Error: {error}"))
+            result_parts.append(f"Error: {error}")
 
-        return contents if contents else [TextContent(type="text", text="Command executed successfully")]
+        return "\n".join(result_parts) if result_parts else "Command executed successfully"
 
 
 class _ModalBashSession:
     """A stateful bash session inside a Modal Sandbox, mirroring _BashSession."""
 
     _started: bool
-    _process: Any
-
-    command: str = "/bin/bash"
     _output_delay: float = 0.2  # seconds
     _timeout: float = 120.0  # seconds
-    _sentinel: str = "<<exit>>"
 
     def __init__(self, sandbox: Any, root: str = "/root/sandbox"):
         self._sandbox = sandbox
@@ -160,249 +162,118 @@ class _ModalBashSession:
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
         self._run_dir = f"{self._root}/runs/{ts}"
         
-
+        self._prefix_cmd = f'cd {self._run_dir}'
+        
+        
     async def start(self):
         if self._started:
             return
         
-        print(f"starting modal bash session in {self._run_dir}")
-        
-        
-        
         # Prepare run directory and copy modded-nanogpt.py if present
-        setup = (
-            f"mkdir -p {shlex.quote(self._run_dir)} && "
-            f"( [ -f /root/modded-nanogpt.py ] && cp /root/modded-nanogpt.py {shlex.quote(self._run_dir)}/ || true ) && "
-            f"( [ -f {shlex.quote(self._root)}/modded-nanogpt.py ] && cp {shlex.quote(self._root)}/modded-nanogpt.py {shlex.quote(self._run_dir)}/ || true )"
+        setup_cmd = (
+            f"mkdir -p {self._run_dir} && "
+            f"cp /root/modded-nanogpt.py {(self._run_dir)}"
         )
         
-        # Start a long-lived interactive bash in the run directory
-        self._process = self._sandbox.exec(
+        _p = self._sandbox.exec(
             "bash",
-            "-lc",
-            f"{setup} && cd {shlex.quote(self._run_dir)} && exec {self.command}",
-            bufsize=1,
+            "-c",
+            setup_cmd,
+            stdout=StreamType.PIPE,
+            stderr=StreamType.PIPE,
         )
-        self._process.wait()
-        print(f"setup: {setup}", "stdout:", self._process.stdout.read(), "stderr:", self._process.stderr.read())
-        print(f"process: {self._process.returncode}")
+        _p.wait()
         self._started = True
 
-    def stop(self):
-        if not self._started:
-            raise RuntimeError("Session has not started.")
-        try:
-            # Try gracefully exiting the shell
-            if getattr(self._process, "stdin", None) is not None:
-                try:
-                    self._process.stdin.write("exit\n")
-                    self._process.stdin.drain()
-                except Exception:
-                    pass
-            # Best-effort: if kill() exists, use it
-            if hasattr(self._process, "kill"):
-                try:
-                    self._process.kill()
-                except Exception:
-                    pass
-        finally:
-            self._started = False
-
-    def _run_blocking(self, command: str) -> Sequence[TextContent]:
-        if not self._started:
-            raise RuntimeError("Session has not started.")
-        # Send command with sentinel
-        self._process.stdin.write(command + f"; echo '{self._sentinel}'\n")
-        self._process.stdin.drain()
-
-        # Read until sentinel
-        out_chunks: list[str] = []
-        sentinel = self._sentinel
-        for line in self._process.stdout:
-            s = line.decode() if isinstance(line, (bytes, bytearray)) else str(line)
-            if sentinel in s:
-                s = s.split(sentinel)[0]
-                if s:
-                    out_chunks.append(s)
-                break
-            out_chunks.append(s)
-
-        output = "".join(out_chunks).rstrip("\n")
-        contents: list[TextContent] = []
-        if output:
-            contents.append(TextContent(type="text", text=output))
-            
-        return contents or [TextContent(type="text", text="Command executed successfully")]
-
-    async def run(self, command: str) -> Sequence[TextContent]:
+    async def run(
+        self, 
+        command: str, 
+        blocking: bool = True,
+    ) -> str:
         # Wrap blocking read/write in a thread to avoid blocking the event loop
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._run_blocking, command)
-    
-    
+        _p = self._sandbox.exec(
+            "bash",
+            "-c",
+            f"{self._prefix_cmd} && {command}",
+        )
+        if blocking:
+            _p.wait()
+            stdout = _p.stdout.read()
+            stderr = _p.stderr.read()
+            if stderr:
+                return f"stdout: {stdout}\nstderr: {stderr}"
+            return f"stdout: {stdout}"
     
 class BashContainer:
     """
     Stateful bash container that supports local and Modal Sandbox execution,
-    background jobs, and session restart. Register with FastMCP via mcp.tool(obj.bash).
+    background jobs, and session restart. 
     """
-
-    def __init__(self, automount_path: str = automount_path, sandbox: Any | None = None, sandbox_root: str = "/root/sandbox"):
-        self._session: Any | None = None
-        self._sandbox: Any | None = sandbox
-        self._modal_session: Any | None = None
+    _session: _ModalBashSession | _BashSession
+    def __init__(
+        self, 
+        sandbox: modal.Sandbox | None = None, 
+        automount_path: str = '/root/sandbox', 
+    ):
+        if sandbox is not None:
+            self._session = _ModalBashSession(sandbox, root=automount_path)
+        else:
+            self._session = _BashSession(automount_path=automount_path)
+        
         self._jobs: Dict[str, Dict[str, Any]] = {}
-        self._sandbox_root = sandbox_root
+        self._sandbox_root = automount_path
         self._automount_path = automount_path
 
     async def ensure_cwd(self) -> str:
         """Ensure a session is started and return its working directory."""
-        if self._sandbox is not None:
-            if self._modal_session is None:
-                self._modal_session = _ModalBashSession(self._sandbox, root=self._sandbox_root)
-                await self._modal_session.start()
-            return self._modal_session._run_dir
-        else:
-            if self._session is None:
-                self._session = _BashSession(automount_path=self._automount_path)
-                await self._session.start()
-            return self._session._run_dir
+        await self._session.start()
+        return self._session._run_dir   
 
     async def bash(
         self,
-        command: Annotated[str | None, Field(description="The bash command to execute")]=None,
-        restart: Annotated[bool, Field(description="Restart the bash session (new run dir)")]=False,
-        background: Annotated[bool, Field(description="Run command as a background job and return immediately")]=False,
-        name: Annotated[str | None, Field(description="Job name for background, peek, stop, or poll")]=None,
-        peek: Annotated[bool, Field(description="Peek logs for a named background job")]=False,
-        stop: Annotated[bool, Field(description="Stop a named background job")]=False,
-        lines: Annotated[int, Field(description="Number of log lines to show when peeking", ge=1, le=10000)]=100,
-        list_jobs: Annotated[bool, Field(description="List background jobs tracked by this session")]=False,
-        poll: Annotated[bool, Field(description="Poll status (RUNNING/STOPPED) for a named background job")]=False,
+        command: Annotated[str | None, Field(
+            description="The bash command to execute"
+        )]=None,
+        restart: Annotated[bool, Field(
+            description="Restart the bash session (new run dir)"
+        )]=False,
+        background: Annotated[bool, Field(
+            description="Run a bash command as a background job and return immediately"
+        )]=False,
+        name: Annotated[str | None, Field(
+            description="Job name for background, peek, stop, or poll"
+        )]=None,
+        stop: Annotated[bool, Field(
+            description="Stop a named background job"
+        )]=False,
+        list_jobs: Annotated[bool, Field(
+            description="List background jobs tracked by this session"
+        )]=False,
+        poll: Annotated[bool, Field(
+            description=(
+                "Poll status (RUNNING/STOPPED) for a named background job,"
+                "useful for monitoring the job and checking if it is still running"
+            )
+        )]=False,
         ctx : Context = None
     ) -> str:
         '''
         Args: 
             
         '''
-        ctx.debug(f"bash command: {command}")
+        ctx.debug(f"bash command: {command}") if ctx else None
         # Modal sandboxed session
-        if self._sandbox is not None:
-            if restart:
-                if self._modal_session:
-                    self._modal_session.stop()
-                self._modal_session = _ModalBashSession(self._sandbox, root=self._sandbox_root)
-                await self._modal_session.start()
-                return f"tool has been restarted. cwd: {self._modal_session._run_dir}"
-
-            if self._modal_session is None:
-                self._modal_session = _ModalBashSession(self._sandbox, root=self._sandbox_root)
-                await self._modal_session.start()
-
-            if (
-                command is None and not background and not peek and not stop and not list_jobs and not poll
-            ):
-                return f"tool started. cwd: {self._modal_session._run_dir}"
-
-            logs_dir = f"{self._modal_session._run_dir}/.mcp_logs"
-
-            if list_jobs:
-                if not self._jobs:
-                    return "No background jobs."
-                lines_out: list[str] = []
-                for jname, job in self._jobs.items():
-                    pid = job.get("pid", -1)
-                    out = await self._modal_session.run(f"kill -0 {pid} >/dev/null 2>&1; echo $?")
-                    text = "\n".join(getattr(c, 'text', '') for c in out if getattr(c, 'text', '')).strip()
-                    code = text.splitlines()[-1] if text else "1"
-                    status = "RUNNING" if code == "0" else "STOPPED"
-                    lines_out.append(f"- {jname}: {status} (pid {pid}) log: {job.get('log','')}")
-                return "\n".join(lines_out)
-
-            if background:
-                if not command:
-                    raise ValueError("background requires a 'command'")
-                if not name:
-                    raise ValueError("background requires a 'name'")
-                log_file = f"{logs_dir}/{name}.log"
-                start_cmd = (
-                    f"mkdir -p {shlex.quote(logs_dir)} && "
-                    f"nohup bash -lc {shlex.quote(command)} > {shlex.quote(log_file)} 2>&1 & echo $!"
-                )
-                out = await self._modal_session.run(start_cmd)
-                text = "\n".join(getattr(c, 'text', '') for c in out if getattr(c, 'text', ''))
-                pid_line = text.strip().splitlines()[-1] if text.strip() else ""
-                try:
-                    pid = int(pid_line)
-                except Exception:
-                    pid = -1
-                self._jobs[name] = {"pid": pid, "log": log_file}
-                return (
-                    f"Started job '{name}' pid {pid}. Logs: {log_file}.\n"
-                    "This process is running in the background. You can:\n"
-                    f"- peek logs: {{'peek': true, 'name': '{name}', 'lines': 100}}\n"
-                    f"- poll status: {{'poll': true, 'name': '{name}'}}\n"
-                    f"- stop job: {{'stop': true, 'name': '{name}'}}\n"
-                    f"- list jobs: {{'list_jobs': true}}"
-                )
-
-            if peek:
-                if not name:
-                    raise ValueError("peek requires a 'name'")
-                job = self._jobs.get(name)
-                if not job:
-                    raise ValueError(f"unknown job '{name}'")
-                log = shlex.quote(job['log'])
-                out = await self._modal_session.run(
-                    f"if [ -f {log} ]; then tail -n {lines} {log}; else echo 'no logs yet for {name}'; fi"
-                )
-                return "\n".join(getattr(c, 'text', '') for c in out if getattr(c, 'text', ''))
-
-            if stop:
-                if not name:
-                    raise ValueError("stop requires a 'name'")
-                job = self._jobs.get(name)
-                if not job:
-                    raise ValueError(f"unknown job '{name}'")
-                await self._modal_session.run(f"kill {job['pid']} || true")
-                return f"stopped job '{name}' (pid {job['pid']})"
-
-            if poll:
-                if not name:
-                    raise ValueError("poll requires a 'name'")
-                job = self._jobs.get(name)
-                if not job:
-                    raise ValueError(f"unknown job '{name}'")
-                out = await self._modal_session.run(f"kill -0 {job['pid']} >/dev/null 2>&1; echo $?")
-                text = "\n".join(getattr(c, 'text', '') for c in out if getattr(c, 'text', '')).strip()
-                code = text.splitlines()[-1] if text else "1"
-                status = "RUNNING" if code == "0" else "STOPPED"
-                return f"{name}: {status} (pid {job['pid']})"
-
-            if command is not None:
-                out = await self._modal_session.run(command)
-                return "\n".join(getattr(c, 'text', '') for c in out if getattr(c, 'text', ''))
-
-            raise ValueError("no command provided.")
-
-        # Local session mode
         if restart:
-            if self._session:
-                self._session.stop()
-            self._session = _BashSession(automount_path=self._automount_path)
             await self._session.start()
+            self._session = _ModalBashSession(self._sandbox, root=self._sandbox_root)
             return f"tool has been restarted. cwd: {self._session._run_dir}"
 
-        if self._session is None:
-            self._session = _BashSession(automount_path=self._automount_path)
-            await self._session.start()
-
         if (
-            command is None and not background and not peek and not stop and not list_jobs and not poll
+            command is None and not background and not stop and not list_jobs and not poll
         ):
             return f"tool started. cwd: {self._session._run_dir}"
 
-        logs_dir = os.path.join(self._session._run_dir, ".mcp_logs")
+        logs_dir = ".mcp_logs"
 
         if list_jobs:
             if not self._jobs:
@@ -411,49 +282,49 @@ class BashContainer:
             for jname, job in self._jobs.items():
                 pid = job.get("pid", -1)
                 out = await self._session.run(f"kill -0 {pid} >/dev/null 2>&1; echo $?")
-                text = "\n".join(getattr(c, 'text', '') for c in out if getattr(c, 'text', '')).strip()
+                text = out.strip()
                 code = text.splitlines()[-1] if text else "1"
                 status = "RUNNING" if code == "0" else "STOPPED"
                 lines_out.append(f"- {jname}: {status} (pid {pid}) log: {job.get('log','')}")
             return "\n".join(lines_out)
 
+        
         if background:
             if not command:
                 raise ValueError("background requires a 'command'")
             if not name:
                 raise ValueError("background requires a 'name'")
-            os.makedirs(logs_dir, exist_ok=True)
-            log_file = os.path.join(logs_dir, f"{name}.log")
-            out = await self._session.run(
-                f"mkdir -p {shlex.quote(logs_dir)} && nohup bash -lc {shlex.quote(command)} > {shlex.quote(log_file)} 2>&1 & echo $!"
-            )
-            text = "\n".join(getattr(c, 'text', '') for c in out if getattr(c, 'text', ''))
-            pid_line = text.strip().splitlines()[-1] if text.strip() else ""
-            try:
-                pid = int(pid_line)
-            except Exception:
-                pid = -1
+            
+            # create logs dir if it doesn't exist
+            text = await self._session.run(f"mkdir -p {logs_dir}")
+            print('text post mkdir', text)
+            log_file = f"{logs_dir}/{name}.log"
+            
+            logs_dir = f"{self._session._run_dir}/.mcp_logs"
+            log_file = f"{logs_dir}/{name}.log"
+
+            command = f"""
+            nohup bash -lc 'echo $$ >> {log_file}.pid; {command}' | tee {log_file} 
+            """
+            #nohup bash -lc 'echo $$ >> {log_file}.pid; your_command' | tee {log_file}
+            # get pid by reading first line in tee log file
+            _ = await self._session.run(command, blocking=False)
+            await asyncio.sleep(3) # give enough time for the pid to be written to the log file
+            
+            pid_text = await self._session.run(f"sed -n '1p' {log_file}.pid")
+            #pid_text = stdout: pid
+            pid = int(pid_text.split(': ')[1].strip())
             self._jobs[name] = {"pid": pid, "log": log_file}
+            
             return (
                 f"Started job '{name}' pid {pid}. Logs: {log_file}.\n"
                 "This process is running in the background. You can:\n"
-                f"- peek logs: {{'peek': true, 'name': '{name}', 'lines': 100}}\n"
+                f"- if you want to peek the logs, you can read specific lines via sed.\n"
+                f"- for example to read the first 100 lines, you can use: sed -n '1,100p' '{log_file}'"
                 f"- poll status: {{'poll': true, 'name': '{name}'}}\n"
                 f"- stop job: {{'stop': true, 'name': '{name}'}}\n"
                 f"- list jobs: {{'list_jobs': true}}"
             )
-
-        if peek:
-            if not name:
-                raise ValueError("peek requires a 'name'")
-            job = self._jobs.get(name)
-            if not job:
-                raise ValueError(f"unknown job '{name}'")
-            log = shlex.quote(job['log'])
-            out = await self._session.run(
-                f"if [ -f {log} ]; then tail -n {lines} {log}; else echo 'no logs yet for {name}'; fi"
-            )
-            return "\n".join(getattr(c, 'text', '') for c in out if getattr(c, 'text', ''))
 
         if stop:
             if not name:
@@ -471,13 +342,13 @@ class BashContainer:
             if not job:
                 raise ValueError(f"unknown job '{name}'")
             out = await self._session.run(f"kill -0 {job['pid']} >/dev/null 2>&1; echo $?")
-            text = "\n".join(getattr(c, 'text', '') for c in out if getattr(c, 'text', '')).strip()
+            text = out.strip()
             code = text.splitlines()[-1] if text else "1"
             status = "RUNNING" if code == "0" else "STOPPED"
             return f"{name}: {status} (pid {job['pid']})"
 
         if command is not None:
             out = await self._session.run(command)
-            return "\n".join(getattr(c, 'text', '') for c in out if getattr(c, 'text', ''))
+            return out
 
         raise ValueError("no command provided.")
