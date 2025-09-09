@@ -13,16 +13,19 @@ import time
 from mcp_server import mcp_app
 from agent_viz import AgentLogger, LogLevel, Monitor, TokenUsage, Timing
 from dataclasses import dataclass
-from openai.types.chat.chat_completion_function_tool_param import ChatCompletionFunctionToolParam
+# Removed OpenAI SDK imports; using direct HTTP via httpx
 
 async def main(
-    resume_from_path : str | None = None,
+    resume_from_conversation_path : str | None = None,
+    resume_from_workdir : bool = True, # TODO change to False
 ):
-    from openai import AsyncOpenAI
+    # if True, the workdir might already have changed modified-gpt, converted pdf to markdown etc
+    # so we should change the prompt
+    from utils import chat_completions_create
     
     #oss servers to use: mcp-server-filesystem
 
-    client = AsyncOpenAI(api_key=os.environ['OPENROUTER_API_KEY'], base_url='https://openrouter.ai/api/v1')
+    # Using direct HTTP calls via httpx (no OpenAI SDK)
 
     LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
     SAVE_THRESHOLD = int(os.environ.get("DEMO_SAVE_THRESHOLD", "30"))
@@ -121,7 +124,7 @@ async def main(
         return []
 
     os.environ["USE_MODAL_SANDBOX"] = "1"
-    os.environ["RUN_DIR"] = "/root/sandbox/runs/2025-09-08_19-09-54" #TODO remove
+    os.environ["RUN_DIR"] = "/root/sandbox/runs/2025-09-08_19-09-54"
     mcp_client = Client(mcp_app)
 
     # Visualization helpers
@@ -136,39 +139,29 @@ async def main(
     async with mcp_client:
         tools = await mcp_client.list_tools()
         resume = os.environ.get("DEMO_RESUME", "0") == "1"
-        messages: list[dict]
+
         if resume:
-            loaded = from_logs(resume_from_path)
-            if loaded:
-                logger.log_markdown("Resuming from latest logs", title="Resume")
-                messages = loaded
-            else:
-                logger.log_markdown("No logs found; starting fresh", title="Resume")
-                messages = [
-                    {
-                        "role": "system",
-                        "content": """
-                        You are given the following tools.
-                        - edit; to edit files
-                        - run_command; run terminal commands
-                        - pdf_to_markdown; curls a pdf from a url and converts it to easily readable markdown
-                        """,
-                        'cache_control': {'type': 'ephemeral'}
-                    },
-                    {
-                        "role": "user",
-                        "content": """
-                        modify the modded-nanogpt.py file to implement the technique from this paper.
-                        https://arxiv.org/pdf/2407.04620 .
-                        But check first if the paper hasnt already been downloaded in the papers folder.
-                        Use the tools, note you can get the pdf to markdown using the pdf_to_markdown tool.
-                        In your working folder(which you can see via bash), i have a minimal file for training a
-                        gpt2 style model. modify this file to implement the paper. 
-                        """,
-                        'cache_control': {'type': 'ephemeral'}
-                    },
-                ]
+            loaded = from_logs(resume_from_conversation_path)
+            assert loaded, "No logs found; starting fresh"
+            logger.log_markdown("Resuming from latest logs", title="Resume")
+            messages = loaded
+            # set ephemeral cache control for all messages
+            for msg_idx in range(4):
+                # anthropic claude sonnet 4 has a limit of 4 messages with ephemeral cache control
+                messages[msg_idx]['cache_control'] = {'type': 'ephemeral'}
         else:
+            
+            if resume_from_workdir:
+                text = """
+                You working dir might already contain a partial implementation of the paper and the paper in markdown.
+                Check this before you start converting the pdf to markdown.
+                """
+            else:
+                text = """
+                In your working folder(which you can see via bash), i have a minimal file for training a
+                gpt2 style model. modify this file to implement the paper.
+                """
+            
             messages = [
                 {
                     "role": "system",
@@ -182,12 +175,12 @@ async def main(
                 },
                 {
                     "role": "user",
-                    "content": """
+                    "content": f"""
                     modify the modded-nanogpt.py file to implement the technique from this paper.
                     https://arxiv.org/pdf/2407.04620
                     Use the tools, note you can get the pdf to markdown using the pdf_to_markdown tool.
-                    In your working folder(which you can see via bash), i have a minimal file for training a
-                    gpt2 style model. modify this file to implement the paper.
+                    {text}
+                    You have access to an A100 80GB GPU, use it to conduct training runs.
                     """,
                     'cache_control': {'type': 'ephemeral'}
                 },
@@ -202,8 +195,6 @@ async def main(
                 subtitle=f"Tools available: {', '.join([t.name for t in tools])}",
                 title="Demo Run",
             )
-        
-            
         
         max_iters = 100
         iters = 0
@@ -224,35 +215,38 @@ async def main(
                 ]
 
                 t0 = time.time()
-                response = await client.chat.completions.create(
+                response = await chat_completions_create(
                     #model="google/gemini-2.5-pro",
                     model="anthropic/claude-sonnet-4",
                     # model="openai/gpt-5",
                     messages=messages,
                     tools=tools_list,
+                    reasoning={"max_tokens": 20_000}
                 )
                 t1 = time.time()
 
                 # Token usage accounting (best-effort)
-                usage = getattr(response, 'usage', None)
-                token_usage = None
-                if usage is not None:
-                    try:
-                        input_tokens = getattr(usage, 'prompt_tokens', None) or getattr(usage, 'total_tokens', 0)
-                        output_tokens = getattr(usage, 'completion_tokens', 0)
-                        token_usage = TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
-                    except Exception:
-                        token_usage = None
+                if not hasattr(response, "usage"):
+                    logger.log_error(f"No usage found in response: {response.__dict__.keys()}")
+                    token_usage = None
+                else:
+                    usage = response.usage
+                    token_usage = TokenUsage(input_tokens=usage.prompt_tokens, output_tokens=usage.completion_tokens)
 
                 step_log = StepLog(timing=Timing(start_time=t0, end_time=t1), token_usage=token_usage)
                 monitor.update_metrics(step_log)
                 logger.log(f"LLM call duration: {t1 - t0:.2f}s", level=LogLevel.INFO)
 
+                reasoning = response.choices[0].message.reasoning
+                if reasoning:
+                    logger.log_markdown(reasoning, title="Reasoning Details")
+                
                 messages.append({
                     'role': response.choices[0].message.role,
                     'content': response.choices[0].message.content,
                     'tool_calls': response.choices[0].message.tool_calls,
-                })
+                    'reasoning': str(reasoning),
+                    })
                 iters += 1
 
                 if not saved_on_threshold and len(messages) >= SAVE_THRESHOLD:
@@ -297,10 +291,10 @@ async def main(
                         try:
                             result = await mcp_client.call_tool(tool_name, tool_input)
                             print(f"result: {result} from tool {tool_name}")
-                            content_blocks = getattr(result, 'content', [])
+                            content_blocks = result.content
                             out_texts = []
                             for b in content_blocks:
-                                if getattr(b, 'type', '') == 'text' and hasattr(b, 'text'):
+                                if b.type == 'text' and b.text:
                                     out_texts.append(b.text)
                             rendered = "\n".join(out_texts) if out_texts else str(result)
                             if len(rendered) > 2000:
@@ -313,10 +307,10 @@ async def main(
                                 content=[TextContent(type="text", text=f"Error calling tool: {str(e)}")],
                                 is_error=True,
                             )
-                        content_blocks = getattr(result, 'content', [])
+                        content_blocks = result.content
                         out_texts = []
                         for b in content_blocks:
-                            if getattr(b, 'type', '') == 'text' and hasattr(b, 'text'):
+                            if b.type == 'text' and b.text:
                                 out_texts.append(b.text)
                         messages.append({
                             'role': 'tool',
@@ -343,4 +337,10 @@ async def main(
         )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    #
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume_from_conversation_path", type=str, default=None)
+    parser.add_argument("--resume_from_workdir", type=bool, default=True)
+    args = parser.parse_args()
+    asyncio.run(main(args.resume_from_conversation_path, args.resume_from_workdir))

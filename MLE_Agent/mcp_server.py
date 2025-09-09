@@ -54,7 +54,8 @@ if _use_modal:
                 "/root/sandbox": agent_volume,
                 "/root/fineweb10B": fineweb10B_volume,
             },
-            "timeout": 60*20,
+            "timeout": 60*5,
+            #'gpu': 'A100-80GB:1'
         }
         _shared_sandbox = LazySandBox(**kwargs)
     except Exception as e:
@@ -64,7 +65,10 @@ if _use_modal:
         _shared_sandbox = None
         
 
-_run_dir_env = os.environ.get("RUN_DIR") or os.environ.get("DEMO_RUN_DIR")
+#_run_dir_env = os.environ.get("RUN_DIR") or os.environ.get("DEMO_RUN_DIR")
+
+_run_dir_env = "/root/sandbox/runs/2025-09-08_19-09-54"
+
 _bash_state = (
     BashContainer(sandbox=_shared_sandbox, automount_path="/root/sandbox", run_dir=_run_dir_env)
     if _shared_sandbox
@@ -123,16 +127,18 @@ mcp_app.tool(_edit_state.write_file)
 mcp_app.tool(_pdf_state.pdf_to_markdown)
 
 # memory tools
-mcp_app.tool(_memory_state.read_graph)
-mcp_app.tool(_memory_state.create_entities)
-mcp_app.tool(_memory_state.create_relations)
-mcp_app.tool(_memory_state.add_observations)
-mcp_app.tool(_memory_state.delete_entities)
-mcp_app.tool(_memory_state.delete_observations)
-mcp_app.tool(_memory_state.delete_relations)
-mcp_app.tool(_memory_state.search_nodes)
-mcp_app.tool(_memory_state.open_nodes)
+ADD_MEMORY_TOOLS = False #os.environ.get("ADD_MEMORY_TOOLS", "1") == "1"
 
+if ADD_MEMORY_TOOLS:
+    mcp_app.tool(_memory_state.read_graph)
+    mcp_app.tool(_memory_state.create_entities)
+    mcp_app.tool(_memory_state.create_relations)
+    mcp_app.tool(_memory_state.add_observations)
+    mcp_app.tool(_memory_state.delete_entities)
+    mcp_app.tool(_memory_state.delete_observations)
+    mcp_app.tool(_memory_state.delete_relations)
+    mcp_app.tool(_memory_state.search_nodes)
+    mcp_app.tool(_memory_state.open_nodes)
 
 if __name__ == "__main__":
     # Default to stdio transport; FastMCP CLI can also run this script directly

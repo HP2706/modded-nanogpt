@@ -76,7 +76,7 @@ class EditContainer:
                     msg = f"Error: {stderr}"
                 return msg or ""
             else:
-                p = await self._sandbox.exec(
+                p = self._sandbox.exec(
                     'bash',
                     '-c',
                     rf"find {path} -maxdepth 2 -not -path '*/\.*'",
