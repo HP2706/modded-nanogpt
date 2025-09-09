@@ -6,6 +6,7 @@ Preserves Modal Sandbox support (USE_MODAL_SANDBOX=1) and tool names.
 import os
 import logging
 import asyncio
+from typing import Annotated
 from fastmcp import FastMCP
 from tools.bash import BashContainer
 from tools.edit import EditContainer
@@ -21,15 +22,16 @@ mcp_app = FastMCP("modal-server")
 
 # Optional Modal Sandbox for bash/edit tools
 _use_modal = os.environ.get("USE_MODAL_SANDBOX", "1") == "1"  # default to true
+
 _shared_sandbox = None
 
 if _use_modal:
     # if we are not providing a run dir, we need to upload the modded-nanogpt.py file
     with agent_volume.batch_upload(force=True) as batch:
-        #batch.put_file("environments/modded_nanogpt.py", "/root/modded_nanogpt.py") 
+        batch.put_file("environments/modded_nanogpt.py", "/root/modded_nanogpt.py") 
         batch.put_file("environments/modded_nanogpt_unoptimized.py", "/root/modded_nanogpt_unoptimized.py")
-        batch.put_file("environments/cifar_speedrun_unoptimized.py", "/root/cifar_speedrun.py") # RENAME FILE DELIBERATELY
-        #batch.put_file('environments/cifar_speedrun.py', '/root/cifar_speedrun.py')
+        batch.put_file("environments/cifar_speedrun_unoptimized.py", "/root/cifar_speedrun_unoptimized.py") # RENAME FILE DELIBERATELY
+        batch.put_file('environments/cifar_speedrun.py', '/root/cifar_speedrun.py')
     
     try:
         modal_app = modal.App.lookup("mle-agent-tools", create_if_missing=True)
@@ -46,6 +48,7 @@ if _use_modal:
             "einx",
             "matplotlib",
             "wandb",
+            "torchvision",
         )
         
         kwargs = {
@@ -55,9 +58,9 @@ if _use_modal:
                 "/root/sandbox": agent_volume,
                 "/root/fineweb10B": fineweb10B_volume,
             },
-            "timeout": 60*5,
+            "timeout": 60*10,
             "secrets": [Secret.from_name("wandb")],
-            #'gpu': 'A100-80GB:1'
+            'gpu': 'A100-80GB:1'
         }
         _shared_sandbox = LazySandBox(**kwargs)
     except Exception as e:
@@ -67,20 +70,24 @@ if _use_modal:
         _shared_sandbox = None
         
 
-#_run_dir_env = os.environ.get("RUN_DIR") or os.environ.get("DEMO_RUN_DIR")
-
-_run_dir_env = "/root/sandbox/runs/2025-09-08_19-09-54"
+_run_dir_env = os.environ.get("RUN_DIR") 
+_file_name_env = os.environ.get("FILE_NAME")
 
 _bash_state = (
-    BashContainer(sandbox=_shared_sandbox, automount_path="/root/sandbox", run_dir=_run_dir_env)
+    BashContainer(
+        sandbox=_shared_sandbox, 
+        automount_path="/root/sandbox", 
+        run_dir=_run_dir_env,
+        file_name=_file_name_env
+    )
     if _shared_sandbox
-    else BashContainer(run_dir=_run_dir_env)
+    else BashContainer(
+        run_dir=_run_dir_env,
+        file_name=_file_name_env,
+    )
 )
 
-async def get_automount_path():
-    return await _bash_state.ensure_cwd()
-
-automount_path = asyncio.run(get_automount_path())
+automount_path = _bash_state._run_dir
 
 _edit_state = (
     EditContainer(
@@ -109,6 +116,26 @@ _memory_state = (
 )
 
 
+#@mcp_app.tool(enabled=False)
+#async def get_run_dir() -> str:
+#    return await _bash_state.ensure_cwd()
+
+from pydantic import Field
+@mcp_app.tool
+def sleep(
+    seconds: Annotated[int, Field(
+        description="""
+        The number of seconds to sleep this is useful when you are training a model and want to 
+        wait a couple of minutes before you continue. But be careful to not sleep for too long as
+        you will lose the opportunity to intervene and fix a training issue or bug.
+        """,
+        le=10*60,
+        ge=60
+    )]
+) -> str:
+    import time
+    time.sleep(seconds)
+    return f"slept for {seconds} seconds"
 
 # Register object methods directly so they can share state
 # bash tools

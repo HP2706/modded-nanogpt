@@ -32,30 +32,31 @@ class _BashSession:
     _timeout: float = 120.0  # seconds
     _sentinel: str = "<<exit>>"
 
-    def __init__(self, automount_path: str = automount_path, run_dir: str | None = None):
-        print("tool is using automount path:", automount_path)
+    def __init__(
+        self, 
+        automount_path: str = automount_path, 
+        run_dir: str | None = None, 
+        file_name: str | None = None
+    ):
         self._started = False
         self._timed_out = False
         self._automount_path = automount_path
-        if run_dir:
-            self._run_dir = run_dir
-        else:
-            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
-            self._run_dir = os.path.join(self._automount_path, "runs", ts)
-
+        self._file_name = f'environments/{file_name}'
+        self._run_dir = run_dir
+    
     async def start(self):
         if self._started:
             return
 
-        # Ensure dated run directory exists and copy modded-nanogpt.py if present
+        # Ensure dated run directory exists and copy file_name if present
         os.makedirs(self._run_dir, exist_ok=True)
         for src in [
-            Path.cwd() / "modded-nanogpt.py",
-            Path(self._automount_path).parent / "modded-nanogpt.py",
+            Path.cwd() / self._file_name,
+            Path(self._automount_path).parent / self._file_name,
         ]:
             if src.is_file():
                 try:
-                    shutil.copy2(src, Path(self._run_dir) / "modded-nanogpt.py")
+                    shutil.copy2(src, Path(self._run_dir) / self._file_name)
                 except Exception:
                     pass
                 break
@@ -160,17 +161,15 @@ class _ModalBashSession:
         sandbox: Any,
         root: str = "/root/sandbox",
         run_dir: str | None = None,
+        file_name: str | None = None,
     ):
         self._sandbox = sandbox
         self._root = root
         self._started = False
         self._timed_out = False
-        if run_dir:
-            self._run_dir = run_dir
-        else:
-            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
-            self._run_dir = f"{self._root}/runs/{ts}"
         
+        self._file_name = file_name
+        self._run_dir = run_dir
         self._prefix_cmd = f'cd {self._run_dir}'
         self._started = False
         
@@ -180,7 +179,7 @@ class _ModalBashSession:
         
         setup_cmd = (
             f"mkdir -p {self._run_dir} && "
-            f"cp -n /root/sandbox/modded-nanogpt.py {(self._run_dir)} || true"
+            f"cp -n /root/sandbox/{self._file_name} {(self._run_dir)} || true"
         ) # cp -n means copy only if the file does not exist
 
         _p = self._sandbox.exec(
@@ -204,14 +203,6 @@ class _ModalBashSession:
         if not self._started:
             await self.start()
             
-        _p1 = self._sandbox.exec(
-            "bash",
-            "-c",
-            f"ls {self._run_dir}",  
-        )
-        _p1.wait()
-        print(f"ls {self._run_dir}: {_p1.stdout.read()} {_p1.stderr.read()}")
-        
         _p = self._sandbox.exec(
             "bash",
             "-c",
@@ -235,20 +226,30 @@ class BashContainer:
         sandbox: LazySandBox | None = None,
         automount_path: str = '/root/sandbox',
         run_dir: str | None = None,
+        file_name: str | None = None,
     ):
         self._sandbox = sandbox
-        if sandbox is not None:
-            self._session = _ModalBashSession(sandbox, root=automount_path, run_dir=run_dir)
-        else:
-            self._session = _BashSession(automount_path=automount_path, run_dir=run_dir)
-        
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._sandbox_root = automount_path
         self._automount_path = automount_path
+        if run_dir:
+            self._run_dir = run_dir
+        else:
+            self._run_dir = os.path.join(self._automount_path, "runs", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H-%M-%S"))
 
-    async def ensure_cwd(self) -> str:
+        self._file_name = file_name
+        if sandbox is not None:
+            self._session = _ModalBashSession(sandbox, root=automount_path, run_dir=self._run_dir, file_name=file_name)
+        else:
+            self._session = _BashSession(automount_path=automount_path, run_dir=self._run_dir, file_name=file_name)
+        
+        # spawn in a thread
+        asyncio.create_task(self._session.start())
+        #self._session.start()
+        
+    def ensure_cwd(self) -> str:
         """Ensure a session is started and return its working directory."""
-        await self._session.start()
+        self._session.start()
         return self._session._run_dir
 
     async def restart_session(
@@ -261,9 +262,9 @@ class BashContainer:
         # Stop isn't strictly necessary since we start a fresh session object
         # Create new session with optional run_dir
         if isinstance(self._session, _ModalBashSession):
-            self._session = _ModalBashSession(self._sandbox, root=self._sandbox_root, run_dir=run_dir)
+            self._session = _ModalBashSession(self._sandbox, root=self._sandbox_root, run_dir=run_dir, file_name=self._file_name)
         else:
-            self._session = _BashSession(automount_path=self._automount_path, run_dir=run_dir)
+            self._session = _BashSession(automount_path=self._automount_path, run_dir=run_dir, file_name=self._file_name)
         await self._session.start()
         return f"tool has been restarted. cwd: {self._session._run_dir}"
 

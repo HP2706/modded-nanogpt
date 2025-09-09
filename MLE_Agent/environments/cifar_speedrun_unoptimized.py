@@ -287,6 +287,10 @@ if __name__ == "__main__":
     # We re-use the compiled model between runs to save the non-data-dependent compilation time
     model = CifarNet().cuda().to(memory_format=torch.channels_last).requires_grad_(True)
 
+    log_dir = os.path.join("logs", str(uuid.uuid4()))
+    log_path = os.path.join(log_dir, "log.pt")
+    print("log_path:", os.path.abspath(log_path))
+
     print_columns(logging_columns_list, is_head=True)
     main("warmup", model)
     # do 10 runs and collect accuracy and time
@@ -296,9 +300,5 @@ if __name__ == "__main__":
     times = torch.tensor(times)
     print("Acc Mean: %.4f    Acc Std: %.4f" % (accs.mean(), accs.std()))
     print("Time Mean (s): %.4f    Time Std (s): %.4f" % (times.mean(), times.std()))
-
-    log_dir = os.path.join("logs", str(uuid.uuid4()))
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "log.pt")
     torch.save(dict(code=code, accs=accs), log_path)
-    print(os.path.abspath(log_path))

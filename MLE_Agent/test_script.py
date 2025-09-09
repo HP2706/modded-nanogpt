@@ -31,7 +31,8 @@ image = modal.Image.from_registry(
         '/root/sandbox': agent_volume
     },
     gpu='A100-80GB:1',
-    secrets=[Secret.from_name("wandb")]
+    secrets=[Secret.from_name("wandb")],
+    timeout=60*10 # 10 minutes
 )
 def test_script():
     import subprocess

@@ -332,14 +332,5 @@ class EditContainer:
             suffix = p_str.lstrip("/") if path.is_absolute() else p_str
         
         path = Path(self._automount_path) / suffix
-        
-        if self._sandbox is not None:
-            p = self._sandbox.exec('bash', '-c', f'ls {path}')
-            p.wait()
-            stdout = p.stdout.read()
-            stderr = p.stderr.read()
-            print(f"error: {stderr.strip()}")
-            print(f"stdout: {stdout}")
-        
         return path
 
