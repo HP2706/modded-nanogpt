@@ -7,9 +7,10 @@ import uuid
 import time
 import copy
 import glob
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
+from dataclasses_json import dataclass_json
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -19,8 +20,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-#torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-
+import wandb  
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -553,11 +553,22 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
 # -----------------------------------------------------------------------------
 # int main
 
+
+# number of local GPUs and gradient accumulation to emulate 8-GPU global batch
+ngpus = torch.cuda.device_count()
+target_ngpus = 8
+# accumulate enough micro-steps to match the effective global batch of 8 GPUs
+from math import ceil
+grad_accum_steps = max(1, ceil(target_ngpus / max(1, ngpus)))
+
+import datetime
+
+@dataclass_json
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "/root/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "/root/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    train_files = "/root/data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files = "/root/data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
@@ -567,12 +578,19 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    # logging granularity
+    log_every_tokens: int = 50_000 #~10 steps
+    logs_path = f'/root/sandbox/logs_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    
 args = Hyperparameters()
+os.makedirs(args.logs_path, exist_ok=True)
+import glob
+assert len(glob.glob(args.train_files)) > 0, f"No train files found in {args.train_files} got glob: {glob.glob(args.train_files)}"
+assert len(glob.glob(args.val_files)) > 0, f"No val files found in {args.val_files} got glob: {glob.glob(args.val_files)}"
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
-world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+world_size = int(os.environ["WORLD_SIZE"])  # number of distributed processes
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -584,8 +602,8 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 logfile = None
 if master_process:
     run_id = uuid.uuid4()
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
+    os.makedirs(args.logs_path, exist_ok=True)
+    logfile = f"{args.logs_path}/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -605,6 +623,16 @@ def nvidia_smi():
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
+
+# Initialize Weights & Biases on master process, if available
+if master_process:
+    _run_name = f"optimized_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    wandb.init(
+        project="modded-nanogpt",
+        name=_run_name,
+        config=args.to_dict(),
+        reinit=True,
+    )
 
 model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
@@ -664,6 +692,7 @@ initial_state = dict(model=copy.deepcopy(model.state_dict()),
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
+    # single warmup step to compile kernels
     model(inputs, targets, get_window_size_blocks(1)).backward()
     for opt in optimizers:
         opt.step()
@@ -679,6 +708,9 @@ del train_loader, initial_state
 
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 training_time_ms = 0
+# token accounting
+tokens_seen = 0
+next_tokens_log = args.log_every_tokens
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
@@ -706,6 +738,15 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        # mirror to wandb
+        if master_process:
+            wandb.log({
+                "val/loss": float(val_loss.item()),
+                "time/train_ms": float(training_time_ms),
+                "time/step_avg_ms": float(training_time_ms / max(step, 1)),
+                "step": step,
+            }, step=step)
+
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -714,14 +755,38 @@ for step in range(train_steps + 1):
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            os.makedirs(f"{args.logs_path}/{run_id}", exist_ok=True)
+            torch.save(log, f"{args.logs_path}/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
     # --------------- TRAINING SECTION -----------------
-    inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    # Accumulate gradients over multiple micro-steps to emulate 8-GPU global batch
+    _loss_sum = 0
+    train_log = False
+    for micro in range(grad_accum_steps):
+        inputs, targets = next(train_loader)
+        loss = model(inputs, targets, get_window_size_blocks(step))
+        _loss_sum += loss.item() / grad_accum_steps
+        loss = loss / grad_accum_steps
+        loss.backward()
+        # token accounting per micro-step
+        tokens_seen += (world_size * args.train_seq_len)
+        if master_process and tokens_seen >= next_tokens_log:
+            train_log = True
+    
+    if train_log:
+        print0(f"tokens_seen milestone: {tokens_seen}")
+        if master_process:
+            wandb.log(
+                {"train/tokens_seen": int(tokens_seen), 
+                    "train/step": int(step), 
+                    "train/micro_step": int(micro + 1)}, 
+                step=step)
+        # schedule next milestone
+        k = max(1, tokens_seen // args.log_every_tokens)
+        next_tokens_log = k * args.log_every_tokens + args.log_every_tokens        
+    
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -729,7 +794,7 @@ for step in range(train_steps + 1):
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers
+    # step the optimizers once per accumulated batch
     for opt in optimizers:
         opt.step()
     # null the gradients
@@ -737,7 +802,27 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    # mirror to wandb
+
+    current_lrs = {}
+    if len(optimizer1.param_groups) > 0:
+        current_lrs["lr/adam"] = float(optimizer1.param_groups[0].get("lr", 0.0))
+    if len(optimizer2.param_groups) > 0:
+        current_lrs["lr/muon"] = float(optimizer2.param_groups[0].get("lr", 0.0))
+    if master_process:
+        wandb.log({
+            **current_lrs,
+            "time/train_ms": float(approx_training_time_ms),
+            "time/step_avg_ms": float(approx_training_time_ms / (step + 1)),
+            "step": step + 1,
+        }, step=step + 1)
+
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+if master_process:
+    wandb.log({
+        "cuda/max_memory_allocated_mib": float(torch.cuda.max_memory_allocated() // 1024 // 1024),
+        "cuda/max_memory_reserved_mib": float(torch.cuda.max_memory_reserved() // 1024 // 1024),
+    })
 dist.destroy_process_group()

@@ -1,6 +1,6 @@
 import modal
 from modal import Volume
-
+from modal import Secret
 
 agent_volume = Volume.from_name("mle-sandbox", create_if_missing=True)
 fineweb10B_volume = Volume.from_name("fineweb10B", create_if_missing=True)    
@@ -19,7 +19,8 @@ image = modal.Image.from_registry(
     "fire",
     "einx",
     "matplotlib",
-    "torchvision"
+    "torchvision",
+    "wandb",
 )
 
 @modal_app.function(
@@ -28,7 +29,8 @@ image = modal.Image.from_registry(
         '/root/data': fineweb10B_volume,
         '/root/sandbox': agent_volume
     },
-    gpu='A100-80GB:1'
+    gpu='A100-80GB:1',
+    secrets=[Secret.from_name("wandb")]
 )
 def test_script():
     import subprocess
@@ -43,8 +45,10 @@ def test_script():
     print(process.stdout.read())
     
     
-    cmd = "python /root/sandbox/cifar_speedrun_unoptimized.py"
-    #cmd = "python /root/sandbox/modded_nanogpt_unoptimized.py"
+    #cmd = "python /root/sandbox/cifar_speedrun_unoptimized.py"
+    cmd = "torchrun /root/sandbox/modded_nanogpt_unoptimized.py"
+    #cmd = "torchrun /root/sandbox/modded_nanogpt.py"
+
     process = subprocess.Popen(cmd, shell=True, 
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

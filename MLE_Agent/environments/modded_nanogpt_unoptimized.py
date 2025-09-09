@@ -7,7 +7,7 @@ import uuid
 import time
 import copy
 import glob
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
 
@@ -18,85 +18,8 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-
-# -----------------------------------------------------------------------------
-@torch.library.custom_op("nanogpt::mm", mutates_args=())
-def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
-    @torch.compile
-    def impl(x: Tensor, w: Tensor):
-        assert x.is_contiguous() and w.is_contiguous()
-        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
-        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
-        out = torch._scaled_mm(
-            x_f8,
-            w_f8.T,
-            out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(x_s, dtype=torch.float32),
-            scale_b=x.new_tensor(w_s, dtype=torch.float32),
-            use_fast_accum=True,
-        )
-        return out, x_f8, w_f8
-
-    return impl(x, w)
-
-@mm_op.register_fake
-def _(x: Tensor, w: Tensor, *_):
-    assert x.ndim == w.ndim == 2
-    assert x.shape[1] == w.shape[1]
-    assert x.device == w.device
-    assert x.is_contiguous() and w.is_contiguous()
-    return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
-
-@torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
-def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-    @torch.compile
-    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
-        assert grad.is_contiguous()
-        x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
-        w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
-        grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
-        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
-        grad_x = torch._scaled_mm(
-            grad_f8,
-            w_f8.T.contiguous().T,
-            out_dtype=torch.bfloat16,
-            scale_a=grad_inv_s,
-            scale_b=w_inv_s,
-            use_fast_accum=False,
-        )
-        # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
-        grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_f8.T.contiguous().T,
-            out_dtype=torch.float32,
-            scale_a=x_inv_s,
-            scale_b=grad_inv_s,
-            use_fast_accum=False,
-        ).T
-        return grad_x, grad_w
-
-    return impl(g, x_f8, w_f8)
-
-@mm_backward_op.register_fake
-def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.T.contiguous().T.to(torch.float32)
-
-def backward(ctx, grad_out: Tensor, *_):
-    x_f8, w_f8 = ctx.saved_tensors
-    x_s, w_s, grad_s = ctx.scales
-    grad_x, grad_w = torch.ops.nanogpt.mm_backward(
-        grad_out, x_f8, w_f8, x_s, w_s, grad_s
-    )
-    return grad_x, grad_w, None, None, None
-
-def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
-    *_, x_s, w_s, grad_s = inputs
-    _, x_f8, w_f8 = output
-    ctx.save_for_backward(x_f8, w_f8)
-    ctx.scales = x_s, w_s, grad_s
-    ctx.set_materialize_grads(False)
-
-mm_op.register_autograd(backward, setup_context=setup_context)
+import wandb
+from torchao.optim import AdamW8bit
 
 class DistAdam(torch.optim.Optimizer):
     def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
@@ -176,28 +99,6 @@ class DistAdam(torch.optim.Optimizer):
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
-class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
-        super().__init__(in_features, out_features, bias=False)
-        self.use_fp8 = use_fp8
-        self.x_s = x_s
-        self.w_s = w_s
-        self.grad_s = grad_s
-
-    def reset_parameters(self) -> None:
-        std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
-        bound = (3 ** 0.5) * std
-        with torch.no_grad():
-            self.weight.uniform_(-bound, bound)
-
-    def forward(self, x: Tensor):
-        if self.use_fp8 and self.training:
-            _x = x.flatten(0, -2)
-            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
-            return out.reshape(*x.shape[:-1], -1)
-        else:
-            return F.linear(x, self.weight.type_as(x))
-
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
@@ -247,8 +148,8 @@ class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim
-        self.c_fc = CastedLinear(dim, hdim)
-        self.c_proj = CastedLinear(hdim, dim)
+        self.c_fc = nn.Linear(dim, hdim)
+        self.c_proj = nn.Linear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
@@ -282,15 +183,9 @@ class GPT(nn.Module):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
-        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
-        # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
-        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
-        # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
-        self.lm_head.weight.detach().zero_() # @Grad62304977
-        # Add learnable skip connection weights for decoder layers
+        self.lm_head = nn.Linear(model_dim, vocab_size, bias=False)
+        self.lm_head.weight.detach().zero_() # 
         assert num_layers % 2 == 0
         pad = (-num_layers * 5) % dist.get_world_size()
         self.scalars = nn.Parameter(torch.cat([
@@ -301,8 +196,6 @@ class GPT(nn.Module):
         ]))
         # set learning rates
         for param in self.embed.parameters():
-            param.lr_mul = 75.
-        for param in self.value_embeds.parameters():
             param.lr_mul = 75.
         self.lm_head.weight.lr_mul = 27.5
         self.scalars.lr_mul = 5.0
@@ -419,30 +312,38 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
 
 # -----------------------------------------------------------------------------
 # int main
+# number of local GPUs and gradient accumulation to emulate 8-GPU global batch
+ngpus = torch.cuda.device_count()
+target_ngpus = 8
+# accumulate enough micro-steps to match the effective global batch of 8 GPUs
+from math import ceil
 
-NGPUS = 1
+import datetime
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "/root/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "/root/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    
-    val_tokens = 10485760 / NGPUS # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 / NGPUS # FlexAttention sequence length
-    val_seq_len = 4*64*1024 / NGPUS # FlexAttention sequence length for validation
+    train_files = "/root/data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files = "/root/data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    train_seq_len = 24*1024 # FlexAttention sequence length
+    val_seq_len = 2*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1750 * NGPUS# number of iterations to run
-    gradient_accum_steps = 8 / NGPUS # 8
+    num_iterations = 3500 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    val_loss_every = 125 * NGPUS # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 250 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    logs_path = f'/root/sandbox/logs_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    # logging granularity (match optimized patterns)
+    log_every_tokens: int = 50_000
+    
 args = Hyperparameters()
+os.makedirs(args.logs_path, exist_ok=True)
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
-world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == NGPUS # this code is designed for 8xH100
+world_size = int(os.environ["WORLD_SIZE"])  # number of distributed processes
+
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -454,9 +355,10 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 logfile = None
 if master_process:
     run_id = uuid.uuid4()
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
+    os.makedirs(args.logs_path, exist_ok=True)
+    logfile = f"{args.logs_path}/{run_id}.txt"
     print(logfile)
+    
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
@@ -476,12 +378,33 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
-for m in model.modules():
-    if isinstance(m, nn.Embedding):
-        m.bfloat16()
+# Initialize Weights & Biases on master process
+if master_process:
+    _run_name = f"unoptimized_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    wandb.init(
+        project="modded-nanogpt",
+        name=_run_name,
+        config=asdict(args),
+        reinit=True,
+    )
+
+model: nn.Module = GPT(
+    vocab_size=50257, 
+    num_layers=12, 
+    num_heads=6, 
+    model_dim=768, 
+    max_seq_len=max(args.train_seq_len, args.val_seq_len)
+).cuda().bfloat16()
+
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
+
+# number of local GPUs and gradient accumulation to emulate 8-GPU global batch
+ngpus = torch.cuda.device_count()
+target_ngpus = 8
+from math import ceil
+grad_accum_steps = max(1, ceil(target_ngpus / max(1, ngpus)))
+assert world_size == ngpus, "Expected one process per GPU on a single node"
 
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
@@ -501,7 +424,7 @@ def get_lr(step: int):
         return w * 1.0 + (1 - w) * 0.1
 
 
-model: nn.Module = torch.compile(model, dynamic=False)
+#model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
 #            Warmup kernels            #
@@ -517,6 +440,7 @@ initial_state = dict(
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
+    # single warmup step to compile kernels
     model(inputs, targets).backward()
     optimizer.step()
     model.zero_grad(set_to_none=True)
@@ -531,6 +455,9 @@ del train_loader, initial_state
 
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 training_time_ms = 0
+# token accounting
+tokens_seen = 0
+next_tokens_log = args.log_every_tokens
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
@@ -558,6 +485,14 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        # mirror to wandb
+        if master_process:
+            wandb.log({
+                "val/loss": float(val_loss.item()),
+                "time/train_ms": float(training_time_ms),
+                "time/step_avg_ms": float(training_time_ms / max(step, 1)),
+                "step": step,
+            }, step=step)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -569,30 +504,62 @@ for step in range(train_steps + 1):
                        code=code, 
                        model=model.state_dict(), 
                        optimizer=optimizer.state_dict())
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            os.makedirs(f"{args.logs_path}/{run_id}", exist_ok=True)
+            torch.save(log, f"{args.logs_path}/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
     # --------------- TRAINING SECTION -----------------
-    inputs, targets = next(train_loader)
-    loss = model(inputs, targets)
-    loss.backward()
-    for p in model.parameters():
-        p.grad /= args.gradient_accum_steps
-        
-    if (step + 1) % args.gradient_accum_steps == 0:
-        optimizer.step()
-        # set optimization hyperparameters
+    # Accumulate gradients over multiple micro-steps to emulate 8-GPU global batch
+    train_log = False
+    for micro in range(grad_accum_steps):
+        inputs, targets = next(train_loader)
+        loss = model(inputs, targets)
+        loss = loss / grad_accum_steps
+        loss.backward()
+        # token accounting per micro-step
+        tokens_seen += (world_size * args.train_seq_len)
+        if master_process and tokens_seen >= next_tokens_log:
+            train_log = True
 
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
-        # null the gradients
-        model.zero_grad(set_to_none=True)
-        # logging
-        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    optimizer.step()
+    # set optimization hyperparameters
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * get_lr(step)
+    # null the gradients
+    model.zero_grad(set_to_none=True)
+    # logging
+    if train_log:
+        print0(f"tokens_seen milestone: {tokens_seen}")
+        if master_process:
+            wandb.log({
+                "train/tokens_seen": int(tokens_seen),
+                "train/step": int(step),
+                "train/micro_step": int(micro + 1),
+            }, step=step)
+        # schedule next milestone
+        k = max(1, tokens_seen // args.log_every_tokens)
+        next_tokens_log = k * args.log_every_tokens + args.log_every_tokens
+
+    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    # mirror to wandb
+    if master_process:
+        current_lr = None
+        if len(optimizer.param_groups) > 0:
+            current_lr = float(optimizer.param_groups[0].get("lr", 0.0))
+        wandb.log({
+            "lr/adam": current_lr,
+            "time/train_ms": float(approx_training_time_ms),
+            "time/step_avg_ms": float(approx_training_time_ms / (step + 1)),
+            "step": step + 1,
+        }, step=step + 1)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+if master_process:
+    wandb.log({
+        "cuda/max_memory_allocated_mib": float(torch.cuda.max_memory_allocated() // 1024 // 1024),
+        "cuda/max_memory_reserved_mib": float(torch.cuda.max_memory_reserved() // 1024 // 1024),
+    })
 dist.destroy_process_group()

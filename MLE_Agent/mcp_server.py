@@ -7,14 +7,13 @@ import os
 import logging
 import asyncio
 from fastmcp import FastMCP
-from typing import Annotated
-from pydantic import Field
 from tools.bash import BashContainer
 from tools.edit import EditContainer
 from tools.pdf import PdfContainer
 from tools.shared import agent_volume, fineweb10B_volume, LazySandBox
 from tools.memory import MemoryContainer
 import modal
+from modal import Secret
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +22,6 @@ mcp_app = FastMCP("modal-server")
 # Optional Modal Sandbox for bash/edit tools
 _use_modal = os.environ.get("USE_MODAL_SANDBOX", "1") == "1"  # default to true
 _shared_sandbox = None
-
 
 if _use_modal:
     # if we are not providing a run dir, we need to upload the modded-nanogpt.py file
@@ -47,6 +45,7 @@ if _use_modal:
             "fire",
             "einx",
             "matplotlib",
+            "wandb",
         )
         
         kwargs = {
@@ -57,6 +56,7 @@ if _use_modal:
                 "/root/fineweb10B": fineweb10B_volume,
             },
             "timeout": 60*5,
+            "secrets": [Secret.from_name("wandb")],
             #'gpu': 'A100-80GB:1'
         }
         _shared_sandbox = LazySandBox(**kwargs)
