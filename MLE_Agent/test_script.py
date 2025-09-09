@@ -21,6 +21,7 @@ image = modal.Image.from_registry(
     "matplotlib",
     "torchvision",
     "wandb",
+    "torchao",
 )
 
 @modal_app.function(

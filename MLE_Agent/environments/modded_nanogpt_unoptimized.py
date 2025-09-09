@@ -8,7 +8,6 @@ import time
 import copy
 import glob
 from dataclasses import dataclass, asdict
-from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -19,7 +18,6 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 import wandb
-from torchao.optim import AdamW8bit
 
 class DistAdam(torch.optim.Optimizer):
     def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
@@ -186,19 +184,10 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         self.lm_head = nn.Linear(model_dim, vocab_size, bias=False)
         self.lm_head.weight.detach().zero_() # 
-        assert num_layers % 2 == 0
-        pad = (-num_layers * 5) % dist.get_world_size()
-        self.scalars = nn.Parameter(torch.cat([
-            torch.ones(num_layers), # skip_weights
-            *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)], # block lambdas
-            *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
-            torch.ones(pad),
-        ]))
         # set learning rates
         for param in self.embed.parameters():
             param.lr_mul = 75.
         self.lm_head.weight.lr_mul = 27.5
-        self.scalars.lr_mul = 5.0
 
     def create_blockmasks(self, input_seq: Tensor):
         BLOCK_SIZE = 128
@@ -325,13 +314,13 @@ class Hyperparameters:
     train_files = "/root/data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "/root/data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 24*1024 # FlexAttention sequence length
-    val_seq_len = 2*64*1024 # FlexAttention sequence length for validation
+    train_seq_len = 48*1024 # FlexAttention sequence length
+    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 3500 # number of iterations to run
+    num_iterations = 1750 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    val_loss_every = 250 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
     logs_path = f'/root/sandbox/logs_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
     # logging granularity (match optimized patterns)
@@ -424,7 +413,7 @@ def get_lr(step: int):
         return w * 1.0 + (1 - w) * 0.1
 
 
-#model: nn.Module = torch.compile(model, dynamic=False)
+model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
 #            Warmup kernels            #
