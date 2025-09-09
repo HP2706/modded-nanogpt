@@ -28,8 +28,10 @@ _shared_sandbox = None
 if _use_modal:
     # if we are not providing a run dir, we need to upload the modded-nanogpt.py file
     with agent_volume.batch_upload(force=True) as batch:
-        assert os.path.exists("modded-nanogpt.py"), "modded-nanogpt.py not found"
-        batch.put_file("modded-nanogpt.py", "modded-nanogpt.py") 
+        #batch.put_file("environments/modded_nanogpt.py", "/root/modded_nanogpt.py") 
+        batch.put_file("environments/modded_nanogpt_unoptimized.py", "/root/modded_nanogpt_unoptimized.py")
+        batch.put_file("environments/cifar_speedrun_unoptimized.py", "/root/cifar_speedrun.py") # RENAME FILE DELIBERATELY
+        #batch.put_file('environments/cifar_speedrun.py', '/root/cifar_speedrun.py')
     
     try:
         modal_app = modal.App.lookup("mle-agent-tools", create_if_missing=True)
